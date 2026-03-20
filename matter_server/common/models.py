@@ -23,6 +23,8 @@ class EventType(Enum):
     SERVER_INFO_UPDATED = "server_info_updated"
     ENDPOINT_ADDED = "endpoint_added"
     ENDPOINT_REMOVED = "endpoint_removed"
+    DISCOVERY_UPDATED = "discovery_updated"
+    COMMISSIONING_PROGRESS = "commissioning_progress"
 
 
 class APICommand(StrEnum):
@@ -51,8 +53,18 @@ class APICommand(StrEnum):
     CHECK_NODE_UPDATE = "check_node_update"
     UPDATE_NODE = "update_node"
     SET_DEFAULT_FABRIC_LABEL = "set_default_fabric_label"
+    UPDATE_FABRIC_LABEL = "update_fabric_label"
+    GET_FABRICS = "get_fabrics"
+    REMOVE_FABRIC = "remove_fabric"
     SET_ACL_ENTRY = "set_acl_entry"
     SET_NODE_BINDING = "set_node_binding"
+    BINDING_ADD = "binding_add"
+    BINDING_REMOVE = "binding_remove"
+    GROUP_ADD = "group_add"
+    GROUP_REMOVE = "group_remove"
+    GROUP_GET_MEMBERSHIP = "group_get_membership"
+    GROUP_SEND_COMMAND = "group_send_command"
+    INIT_GROUP_TESTING_DATA = "init_group_testing_data"
 
 
 EventCallBackType = Callable[[EventType, Any], None]
@@ -105,6 +117,26 @@ class MatterNodeEvent:
     timestamp: int
     timestamp_type: int
     data: dict[str, Any] | None
+
+
+@dataclass
+class MatterFabricInfo:
+    """Representation of a Fabric on a Matter node."""
+
+    fabric_index: int
+    root_public_key: bytes
+    vendor_id: int
+    fabric_id: int
+    node_id: int
+    label: str
+
+
+@dataclass
+class MatterGroupInfo:
+    """Representation of a Group."""
+
+    group_id: int
+    group_name: str
 
 
 @dataclass

@@ -314,6 +314,22 @@ class ChipDeviceControllerWrapper:
                 interactionTimeoutMs=interaction_timeout_ms,
             )
 
+    async def send_group_command(
+        self,
+        group_id: int,
+        command: Any,
+    ) -> None:
+        """Send a group command."""
+        await self._call_sdk(
+            self._chip_controller.SendGroupCommand,
+            groupid=group_id,
+            payload=command,
+        )
+
+    async def init_group_testing_data(self) -> None:
+        """Populate the controller's GroupDataProvider with known test group info and keys."""
+        await self._call_sdk(self._chip_controller.InitGroupTestingData)
+
     async def read(
         self,
         node_id: int,

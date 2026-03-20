@@ -1,10 +1,76 @@
 # Websocket documentation
 
-This list is not intended to be complete, for a complete oversight see the client implementation.
+This document describes the Websocket API for the Python Matter Server.
+
+## Websocket connection
+
+When a client connects to the Matter Server, it will automatically receive a `server_info` message with version information.
+
+```json
+{
+  "fabric_id": 1,
+  "compressed_fabric_id": 1234567890,
+  "schema_version": 1,
+  "min_supported_schema_version": 1,
+  "sdk_version": "1.0.0",
+  "wifi_credentials_set": true,
+  "thread_credentials_set": false,
+  "bluetooth_enabled": true
+}
+```
 
 ## Websocket commands
 
-Here are the most frequently used commands:
+### Server Information
+
+**Get Server Info**
+
+Get version info of the Matter Server.
+
+```json
+{
+  "message_id": "1",
+  "command": "server_info"
+}
+```
+
+**Get Server Diagnostics**
+
+Return a full dump of the server (for diagnostics).
+
+```json
+{
+  "message_id": "1",
+  "command": "diagnostics"
+}
+```
+
+**Get Vendor Names**
+
+Get a map of vendor ids to vendor names.
+
+```json
+{
+  "message_id": "1",
+  "command": "get_vendor_names",
+  "args": {
+    "filter_vendors": [1, 2, 3]
+  }
+}
+```
+
+### Commissioning
+
+**Discover**
+
+Discover Commissionable Nodes (discovered on BLE or mDNS). Returns the current list. New discoveries will be sent as `discovery_updated` events.
+
+```json
+{
+  "message_id": "1",
+  "command": "discover"
+}
+```
 
 **Set WiFi credentials**
 
@@ -35,12 +101,38 @@ Inform the controller about the Thread credentials it needs to use when commissi
 }
 ```
 
+**Set Default Fabric Label**
+
+Set the default fabric label that will be set on a node after successful commissioning.
+
+```json
+{
+  "message_id": "1",
+  "command": "set_default_fabric_label",
+  "args": {
+    "label": "My Home"
+  }
+}
+```
+
+**Update Fabric Label**
+
+Update the fabric label of an already commissioned node.
+
+```json
+{
+  "message_id": "1",
+  "command": "update_fabric_label",
+  "args": {
+    "node_id": 1,
+    "label": "Living Room"
+  }
+}
+```
+
 **Commission with code**
 
-Commission a new device. For WiFi or Thread based devices, the credentials need to be set upfront, otherwise, commissioning will fail. Supports both QR-code syntax (MT:...) and manual pairing code as string.
-The controller will use bluetooth for the commissioning of wireless devices. If the machine running the Python Matter Server controller lacks Bluetooth support, commissioning will only work for devices already connected to the network (by cable or another controller).
-
-Matter QR-code
+Commission a new device using a pairing code. For WiFi or Thread based devices, the credentials need to be set upfront, otherwise, commissioning will fail. Supports both QR-code syntax (MT:...) and manual pairing code as string.
 
 ```json
 {
@@ -52,15 +144,18 @@ Matter QR-code
 }
 ```
 
-Manual pairing code
+**Commission on network**
+
+Commission a device already present on the network.
 
 ```json
 {
   "message_id": "2",
-  "command": "commission_with_code",
+  "command": "commission_on_network",
   "args": {
-    "code": "35325335079",
-    "network_only": true
+    "setup_pin_code": 12345678,
+    "filter_type": 0,
+    "filter": null
   }
 }
 ```
@@ -79,6 +174,37 @@ Returns code to use as discriminator.
   }
 }
 ```
+
+**Get Fabrics**
+
+Get all fabrics commissioned on a node.
+
+```json
+{
+  "message_id": "1",
+  "command": "get_fabrics",
+  "args": {
+    "node_id": 1
+  }
+}
+```
+
+**Remove Fabric**
+
+Remove a specific fabric from a node.
+
+```json
+{
+  "message_id": "1",
+  "command": "remove_fabric",
+  "args": {
+    "node_id": 1,
+    "fabric_index": 1
+  }
+}
+```
+
+### Node Management
 
 **Get Nodes**
 
@@ -107,7 +233,7 @@ Get info of a single Node.
 
 **Start listening**
 
-When the start_listening command is issued, the server will dump all existing nodes. From that moment on all events (including node attribute changes) will be forwarded.
+When the `start_listening` command is issued, the server will dump all existing nodes. From that moment on all events (including node attribute changes) will be forwarded.
 
 ```json
 {
@@ -115,6 +241,181 @@ When the start_listening command is issued, the server will dump all existing no
   "command": "start_listening"
 }
 ```
+
+**Interview Node**
+
+Manually trigger a full interview of a node.
+
+```json
+{
+  "message_id": "1",
+  "command": "interview_node",
+  "args": {
+    "node_id": 1
+  }
+}
+```
+
+**Remove Node**
+
+Remove a Matter node/device from the fabric.
+
+```json
+{
+  "message_id": "1",
+  "command": "remove_node",
+  "args": {
+    "node_id": 1
+  }
+}
+```
+
+**Ping Node**
+
+Ping node on the currently known IP-address(es).
+
+```json
+{
+  "message_id": "1",
+  "command": "ping_node",
+  "args": {
+    "node_id": 1,
+    "attempts": 1
+  }
+}
+```
+
+**Get Node IP Addresses**
+
+Return the currently known (scoped) IP-address(es) for a node.
+
+```json
+{
+  "message_id": "1",
+  "command": "get_node_ip_addresses",
+  "args": {
+    "node_id": 1,
+    "prefer_cache": false,
+    "scoped": false
+  }
+}
+```
+
+### Groups and Bindings
+
+**Group Add**
+
+Add a node's endpoint to a group.
+
+```json
+{
+  "message_id": "1",
+  "command": "group_add",
+  "args": {
+    "node_id": 1,
+    "endpoint": 1,
+    "group_id": 1,
+    "group_name": "My Group"
+  }
+}
+```
+
+**Group Remove**
+
+Remove a node's endpoint from a group.
+
+```json
+{
+  "message_id": "1",
+  "command": "group_remove",
+  "args": {
+    "node_id": 1,
+    "endpoint": 1,
+    "group_id": 1
+  }
+}
+```
+
+**Group Get Membership**
+
+Get all groups a node's endpoint belongs to.
+
+```json
+{
+  "message_id": "1",
+  "command": "group_get_membership",
+  "args": {
+    "node_id": 1,
+    "endpoint": 1
+  }
+}
+```
+
+**Group Send Command**
+
+Send a command to a group of nodes.
+
+```json
+{
+  "message_id": "1",
+  "command": "group_send_command",
+  "args": {
+    "group_id": 1,
+    "cluster_id": 6,
+    "command_name": "On",
+    "payload": {}
+  }
+}
+```
+
+**Init Group Testing Data**
+
+Initialize the controller with test group keys. Required for group commands in development.
+
+```json
+{
+  "message_id": "1",
+  "command": "init_group_testing_data"
+}
+```
+
+**Binding Add**
+
+Add a binding to a node's endpoint.
+
+```json
+{
+  "message_id": "1",
+  "command": "binding_add",
+  "args": {
+    "node_id": 1,
+    "endpoint_id": 1,
+    "target_node_id": 2,
+    "target_endpoint_id": 1,
+    "cluster_id": 6
+  }
+}
+```
+
+**Binding Remove**
+
+Remove a binding from a node's endpoint.
+
+```json
+{
+  "message_id": "1",
+  "command": "binding_remove",
+  "args": {
+    "node_id": 1,
+    "endpoint_id": 1,
+    "target_node_id": 2,
+    "target_endpoint_id": 1,
+    "cluster_id": 6
+  }
+}
+```
+
+### Attributes and Commands
 
 **Read an attribute**
 
@@ -165,7 +466,266 @@ Here is an example of turning on a switch (OnOff cluster)
 }
 ```
 
-**Python script to send a command**
+**Set ACL Entry**
+
+Set access control entries for a node.
+
+```json
+{
+  "message_id": "1",
+  "command": "set_acl_entry",
+  "args": {
+    "node_id": 1,
+    "entry": []
+  }
+}
+```
+
+**Set Node Binding**
+
+Set bindings for a node.
+
+```json
+{
+  "message_id": "1",
+  "command": "set_node_binding",
+  "args": {
+    "node_id": 1,
+    "endpoint": 1,
+    "bindings": []
+  }
+}
+```
+
+### OTA Updates
+
+**Check Node Update**
+
+Check if there is an update for a particular node.
+
+```json
+{
+  "message_id": "1",
+  "command": "check_node_update",
+  "args": {
+    "node_id": 1
+  }
+}
+```
+
+**Update Node**
+
+Update a node to a new software version.
+
+```json
+{
+  "message_id": "1",
+  "command": "update_node",
+  "args": {
+    "node_id": 1,
+    "software_version": 123
+  }
+}
+```
+
+### Miscellaneous
+
+**Import Test Node**
+
+Import test node(s) from a HA or Matter server diagnostics dump.
+
+```json
+{
+  "message_id": "1",
+  "command": "import_test_node",
+  "args": {
+    "dump": "{...}"
+  }
+}
+```
+
+## Websocket events
+
+When a client is listening (after sending the `start_listening` command), it will receive events from the server.
+
+**Node Added**
+
+Fired when a new node is added to the fabric.
+
+```json
+{
+  "event": "node_added",
+  "data": {
+    "node_id": 1,
+    "...": "..."
+  }
+}
+```
+
+**Node Updated**
+
+Fired when a node's information is updated.
+
+```json
+{
+  "event": "node_updated",
+  "data": {
+    "node_id": 1,
+    "...": "..."
+  }
+}
+```
+
+**Node Removed**
+
+Fired when a node is removed from the fabric.
+
+```json
+{
+  "event": "node_removed",
+  "data": 1
+}
+```
+
+**Discovery Updated**
+
+Fired when a commissionable node is discovered or disappears from mDNS.
+
+```json
+{
+  "event": "discovery_updated",
+  "data": {
+    "instance_name": "...",
+    "host_name": "...",
+    "port": 5540,
+    "long_discriminator": 1234,
+    "vendor_id": 1,
+    "product_id": 1,
+    "commissioning_mode": 1,
+    "device_type": 1,
+    "device_name": "...",
+    "pairing_instruction": "...",
+    "pairing_hint": 1,
+    "addresses": ["..."]
+  }
+}
+```
+
+Or for removal:
+
+```json
+{
+  "event": "discovery_updated",
+  "data": {
+    "name": "...",
+    "removed": true
+  }
+}
+```
+
+**Commissioning Progress**
+
+Fired during the commissioning process.
+
+```json
+{
+  "event": "commissioning_progress",
+  "data": {
+    "node_id": 1,
+    "stage": "started"
+  }
+}
+```
+
+**Attribute Updated**
+
+Fired when an attribute value changes.
+
+```json
+{
+  "event": "attribute_updated",
+  "data": [
+    1,
+    "1/6/0",
+    true
+  ]
+}
+```
+
+**Node Event**
+
+Fired when a node event occurs.
+
+```json
+{
+  "event": "node_event",
+  "data": {
+    "node_id": 1,
+    "endpoint_id": 0,
+    "cluster_id": 1,
+    "event_id": 1,
+    "event_number": 1,
+    "priority": 1,
+    "timestamp": 123456789,
+    "timestamp_type": 0,
+    "data": {}
+  }
+}
+```
+
+**Server Shutdown**
+
+Fired when the server is shutting down.
+
+```json
+{
+  "event": "server_shutdown",
+  "data": null
+}
+```
+
+**Server Info Updated**
+
+Fired when the server information is updated.
+
+```json
+{
+  "event": "server_info_updated",
+  "data": {
+    "...": "..."
+  }
+}
+```
+
+**Endpoint Added**
+
+Fired when an endpoint is added to a node.
+
+```json
+{
+  "event": "endpoint_added",
+  "data": {
+    "node_id": 1,
+    "endpoint_id": 1
+  }
+}
+```
+
+**Endpoint Removed**
+
+Fired when an endpoint is removed from a node.
+
+```json
+{
+  "event": "endpoint_removed",
+  "data": {
+    "node_id": 1,
+    "endpoint_id": 1
+  }
+}
+```
+
+## Python script to send a command
 
 Because we use the datamodels of the Matter SDK, this is a little bit more involved.
 Here is an example of turning on a switch:

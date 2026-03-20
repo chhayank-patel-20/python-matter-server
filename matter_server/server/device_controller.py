@@ -68,6 +68,7 @@ from ..common.helpers.util import (
 from ..common.models import (
     APICommand,
     EventType,
+    MatterFabricInfo,
     MatterNodeData,
     MatterNodeEvent,
     NodePingResult,
@@ -893,6 +894,183 @@ class MatterDeviceController:
             node_id, [(endpoint, Clusters.Binding.Attributes.Binding(bindings))]
         )
 
+    @api_command(APICommand.BINDING_ADD)
+    async def binding_add(
+        self,
+        node_id: int,
+        endpoint_id: int,
+        target_node_id: int,
+        target_endpoint_id: int,
+        cluster_id: int,
+    ) -> list[AttributeWriteResult] | None:
+        """Add a binding to a node."""
+        # Read current bindings
+        read_result = await self._chip_device_controller.read_attribute(
+            node_id, [(endpoint_id, Clusters.Binding.Attributes.Binding)]
+        )
+        if read_result is None:
+            return None
+
+        current_bindings: list[Clusters.Binding.Structs.TargetStruct] = (
+            read_result.attributes[endpoint_id][Clusters.Binding][
+                Clusters.Binding.Attributes.Binding
+            ]
+        )
+
+        # Check if already exists
+        for b in current_bindings:
+            if (
+                b.node == target_node_id
+                and b.endpoint == target_endpoint_id
+                and b.cluster == cluster_id
+            ):
+                return None
+
+        # Add new binding
+        current_bindings.append(
+            Clusters.Binding.Structs.TargetStruct(
+                node=target_node_id, endpoint=target_endpoint_id, cluster=cluster_id
+            )
+        )
+        return await self.set_node_binding(node_id, endpoint_id, current_bindings)
+
+    @api_command(APICommand.BINDING_REMOVE)
+    async def binding_remove(
+        self,
+        node_id: int,
+        endpoint_id: int,
+        target_node_id: int,
+        target_endpoint_id: int,
+        cluster_id: int,
+    ) -> list[AttributeWriteResult] | None:
+        """Remove a binding from a node."""
+        # Read current bindings
+        read_result = await self._chip_device_controller.read_attribute(
+            node_id, [(endpoint_id, Clusters.Binding.Attributes.Binding)]
+        )
+        if read_result is None:
+            return None
+
+        current_bindings: list[Clusters.Binding.Structs.TargetStruct] = (
+            read_result.attributes[endpoint_id][Clusters.Binding][
+                Clusters.Binding.Attributes.Binding
+            ]
+        )
+
+        # Remove binding
+        new_bindings = [
+            b
+            for b in current_bindings
+            if not (
+                b.node == target_node_id
+                and b.endpoint == target_endpoint_id
+                and b.cluster == cluster_id
+            )
+        ]
+
+        if len(new_bindings) == len(current_bindings):
+            return None
+
+        return await self.set_node_binding(node_id, endpoint_id, new_bindings)
+
+    @api_command(APICommand.GROUP_ADD)
+    async def group_add(
+        self, node_id: int, endpoint: int, group_id: int, group_name: str
+    ) -> None:
+        """Add node to a group."""
+        # TODO: Implement key management first if needed
+        # For now we rely on the controller having test keys initialized
+        # which can be done via the init_group_testing_data command.
+        await self._chip_device_controller.send_command(
+            node_id,
+            endpoint,
+            Clusters.Groups.Commands.AddGroup(groupID=group_id, groupName=group_name),
+        )
+
+    @api_command(APICommand.GROUP_REMOVE)
+    async def group_remove(self, node_id: int, endpoint: int, group_id: int) -> None:
+        """Remove node from a group."""
+        await self._chip_device_controller.send_command(
+            node_id,
+            endpoint,
+            Clusters.Groups.Commands.RemoveGroup(groupID=group_id),
+        )
+
+    @api_command(APICommand.GROUP_GET_MEMBERSHIP)
+    async def group_get_membership(self, node_id: int, endpoint: int) -> list[int]:
+        """Get group membership of a node."""
+        read_result = await self._chip_device_controller.send_command(
+            node_id,
+            endpoint,
+            Clusters.Groups.Commands.GetGroupMembership([]),
+        )
+        return cast(list[int], read_result.groupList)
+
+    @api_command(APICommand.GROUP_SEND_COMMAND)
+    async def send_group_command(
+        self,
+        group_id: int,
+        cluster_id: int,
+        command_name: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Send a group command."""
+        cluster_cls: Cluster = ALL_CLUSTERS[cluster_id]
+        command_cls = getattr(cluster_cls.Commands, command_name)
+        command = dataclass_from_dict(command_cls, payload, allow_sdk_types=True)
+        await self._chip_device_controller.send_group_command(group_id, command)
+
+    @api_command(APICommand.GET_FABRICS)
+    async def get_fabrics(self, node_id: int) -> list[MatterFabricInfo]:
+        """Get fabrics of a node."""
+        read_response = await self._chip_device_controller.read_attribute(
+            node_id,
+            [(0, Clusters.OperationalCredentials.Attributes.Fabrics)],
+            fabric_filtered=False,
+        )
+        if read_response is None:
+            return []
+
+        fabrics = read_response.attributes[0][Clusters.OperationalCredentials][
+            Clusters.OperationalCredentials.Attributes.Fabrics
+        ]
+        return [
+            MatterFabricInfo(
+                fabric_index=f.fabricIndex,
+                root_public_key=f.rootPublicKey,
+                vendor_id=f.vendorId,
+                fabric_id=f.fabricId,
+                node_id=f.nodeId,
+                label=f.label,
+            )
+            for f in fabrics
+        ]
+
+    @api_command(APICommand.REMOVE_FABRIC)
+    async def remove_fabric(self, node_id: int, fabric_index: int) -> None:
+        """Remove a fabric from a node."""
+        await self._chip_device_controller.send_command(
+            node_id,
+            0,
+            Clusters.OperationalCredentials.Commands.RemoveFabric(
+                fabricIndex=fabric_index
+            ),
+        )
+
+    @api_command(APICommand.UPDATE_FABRIC_LABEL)
+    async def update_fabric_label(self, node_id: int, label: str) -> None:
+        """Update fabric label of a node."""
+        await self._chip_device_controller.send_command(
+            node_id,
+            0,
+            Clusters.OperationalCredentials.Commands.UpdateFabricLabel(label=label),
+        )
+
+    @api_command(APICommand.INIT_GROUP_TESTING_DATA)
+    async def init_group_testing_data(self) -> None:
+        """Populate the controller's GroupDataProvider with known test group info and keys."""
+        await self._chip_device_controller.init_group_testing_data()
+
     @api_command(APICommand.PING_NODE)
     async def ping_node(self, node_id: int, attempts: int = 1) -> NodePingResult:
         """Ping node on the currently known IP-address(es)."""
@@ -1639,10 +1817,39 @@ class MatterDeviceController:
             await info.async_request(self._aiozc.zeroconf, 3000)
             logger.debug("Discovered commissionable Matter node: %s", info)
 
+            # Map MDNS info to CommissionableNodeData
+            props = info.properties
+
+            # convert bytes to int/str
+            def get_prop(key: str, default: Any = None) -> Any:
+                val = props.get(key.encode())
+                if val is None:
+                    return default
+                return val.decode()
+
+            node_data = CommissionableNodeData(
+                instance_name=info.name.split(".")[0],
+                host_name=info.server,
+                port=info.port,
+                long_discriminator=int(get_prop("D", 0)),
+                vendor_id=int(get_prop("V", 0)),
+                product_id=int(get_prop("P", 0)),
+                commissioning_mode=int(get_prop("CM", 0)),
+                device_type=int(get_prop("DT", 0)),
+                device_name=get_prop("DN"),
+                pairing_instruction=get_prop("RI"),
+                pairing_hint=int(get_prop("PH", 0)),
+                addresses=info.parsed_addresses(),
+            )
+            self.server.signal_event(EventType.DISCOVERY_UPDATED, node_data)
+
         if state_change == ServiceStateChange.Added:
             asyncio.create_task(handle_commissionable_node_added())
         elif state_change == ServiceStateChange.Removed:
             logger.debug("Commissionable Matter node disappeared: %s", info)
+            self.server.signal_event(
+                EventType.DISCOVERY_UPDATED, {"name": name, "removed": True}
+            )
 
     def _write_node_state(self, node_id: int, force: bool = False) -> None:
         """Schedule the write of the current node state to persistent storage."""
