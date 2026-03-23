@@ -106,7 +106,7 @@ class WebsocketClientHandler:
                     self._logger.warning("Received non-Text message: %s", msg.data)
                     continue
 
-                self._logger.log(VERBOSE_LOG_LEVEL, "Received: %s", msg.data)
+                self._logger.debug("Received raw message: %s", msg.data)
 
                 try:
                     command_msg = dataclass_from_dict(
@@ -116,11 +116,6 @@ class WebsocketClientHandler:
                     disconnect_warn = f"Received invalid JSON: {msg.data}"
                     break
 
-                self._logger.debug(
-                    "Received command %s with args: %s",
-                    command_msg.command,
-                    command_msg.args,
-                )
                 self._handle_command(command_msg)
 
         except asyncio.CancelledError:
@@ -208,8 +203,8 @@ class WebsocketClientHandler:
                 "Error while handling: %s: %s",
                 message_str,
                 str(err) or err.__class__.__name__,
-                # only print the full stacktrace if verbose logging is enabled
-                exc_info=err if self._logger.isEnabledFor(VERBOSE_LOG_LEVEL) else None,
+                # only print the full stacktrace if debug logging is enabled
+                exc_info=err if self._logger.isEnabledFor(logging.DEBUG) else None,
             )
             self._send_message(ErrorResultMessage(msg.message_id, error_code, str(err)))
         except Exception as err:
