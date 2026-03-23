@@ -40,7 +40,7 @@ class APICommand(StrEnum):
     SET_WIFI_CREDENTIALS = "set_wifi_credentials"
     SET_THREAD_DATASET = "set_thread_dataset"
     OPEN_COMMISSIONING_WINDOW = "open_commissioning_window"
-    DISCOVER = "discover"
+    DISCOVER = "discover_commissionable_nodes"
     INTERVIEW_NODE = "interview_node"
     DEVICE_COMMAND = "device_command"
     REMOVE_NODE = "remove_node"

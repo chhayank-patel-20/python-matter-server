@@ -1,0 +1,6 @@
+{
+  "version": "1.0",
+  "project": "matter-server",
+  "memory_path": ".ai/memory",
+  "session_path": ".ai/sessions"
+}

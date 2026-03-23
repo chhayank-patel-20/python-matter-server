@@ -41,10 +41,6 @@ export interface APICommands {
     requestArgs: {};
     response: {};
   };
-  discover: {
-    requestArgs: {};
-    response: {};
-  };
   interview_node: {
     requestArgs: {};
     response: {};

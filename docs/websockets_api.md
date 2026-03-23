@@ -68,9 +68,11 @@ Discover Commissionable Nodes (discovered on BLE or mDNS). Returns the current l
 ```json
 {
   "message_id": "1",
-  "command": "discover"
+  "command": "discover_commissionable_nodes"
 }
 ```
+
+If the command fails due to internal errors (e.g. `object list can't be used in 'await' expression`), it will return an ErrorResultMessage.
 
 **Set WiFi credentials**
 
