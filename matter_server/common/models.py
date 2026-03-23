@@ -64,6 +64,9 @@ class APICommand(StrEnum):
     GROUP_REMOVE = "group_remove"
     GROUP_GET_MEMBERSHIP = "group_get_membership"
     GROUP_SEND_COMMAND = "group_send_command"
+    GET_GROUPS = "get_groups"
+    ADD_GROUP = "add_group"
+    REMOVE_GROUP = "remove_group"
     INIT_GROUP_TESTING_DATA = "init_group_testing_data"
 
 
@@ -145,6 +148,7 @@ class ServerDiagnostics:
 
     info: ServerInfoMessage
     nodes: list[MatterNodeData]
+    groups: list[MatterGroupInfo]
     events: list[dict]
 
 

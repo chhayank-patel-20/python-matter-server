@@ -397,11 +397,52 @@ Send a command to a group of nodes.
 **Init Group Testing Data**
 
 Initialize the controller with test group keys. Required for group commands in development.
+Note: This is automatically called by the server at startup, but can be called manually if needed.
 
 ```json
 {
   "message_id": "1",
   "command": "init_group_testing_data"
+}
+```
+
+**Get Groups**
+
+Get all groups in the server registry.
+
+```json
+{
+  "message_id": "1",
+  "command": "get_groups"
+}
+```
+
+**Add Group**
+
+Add a group to the server registry.
+
+```json
+{
+  "message_id": "1",
+  "command": "add_group",
+  "args": {
+    "group_id": 1,
+    "group_name": "My Group"
+  }
+}
+```
+
+**Remove Group**
+
+Remove a group from the server registry.
+
+```json
+{
+  "message_id": "1",
+  "command": "remove_group",
+  "args": {
+    "group_id": 1
+  }
 }
 ```
 

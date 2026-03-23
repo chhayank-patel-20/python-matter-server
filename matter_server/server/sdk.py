@@ -153,8 +153,15 @@ class ChipDeviceControllerWrapper:
         setup_pin_code: int,
         discriminator: int,
         is_short_discriminator: bool = False,
+        wifi_credentials: tuple[str, str] | None = None,
+        thread_dataset: str | None = None,
     ) -> int:
         """Commission a device over BLE."""
+        if wifi_credentials:
+            await self.set_wifi_credentials(*wifi_credentials)
+        if thread_dataset:
+            await self.set_thread_operational_dataset(thread_dataset)
+
         return cast(
             int,
             await self._chip_controller.ConnectBLE(

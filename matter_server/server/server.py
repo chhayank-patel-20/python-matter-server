@@ -269,6 +269,7 @@ class MatterServer:
         return ServerDiagnostics(
             info=self.get_info(),
             nodes=self.device_controller.get_nodes(),
+            groups=self.device_controller.get_groups(),
             events=list(self.device_controller.event_history),
         )
 

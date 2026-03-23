@@ -70,6 +70,7 @@ from ..common.models import (
     APICommand,
     EventType,
     MatterFabricInfo,
+    MatterGroupInfo,
     MatterNodeData,
     MatterNodeEvent,
     NodePingResult,
@@ -84,6 +85,7 @@ if TYPE_CHECKING:
     from .server import MatterServer
 
 DATA_KEY_NODES = "nodes"
+DATA_KEY_GROUPS = "groups"
 DATA_KEY_LAST_NODE_ID = "last_node_id"
 
 LOGGER = logging.getLogger(__name__)
@@ -161,6 +163,8 @@ class MatterDeviceController:
         self._compressed_fabric_id: int | None = None
         self._wifi_credentials_set: bool = False
         self._thread_credentials_set: bool = False
+        self._wifi_credentials: tuple[str, str] | None = None
+        self._thread_dataset: str | None = None
         self._setup_node_tasks = dict[int, asyncio.Task]()
         self._nodes_in_ota: set[int] = set()
         self._node_last_seen_on_mdns: dict[int, float] = {}
@@ -175,6 +179,7 @@ class MatterDeviceController:
         self._thread_node_setup_throttle = asyncio.Semaphore(5)
         self._mdns_event_timer: dict[str, asyncio.TimerHandle] = {}
         self._polled_attributes: dict[int, set[str]] = {}
+        self._groups: dict[int, MatterGroupInfo] = {}
         self._custom_attribute_poller_timer: asyncio.TimerHandle | None = None
         self._custom_attribute_poller_task: asyncio.Task | None = None
         self._attribute_update_callbacks: dict[int, list[Callable]] = {}
@@ -189,6 +194,20 @@ class MatterDeviceController:
 
     async def start(self) -> None:
         """Handle logic on controller start."""
+        # load groups from persistent storage
+        groups: dict[str, dict] = self.server.storage.get(DATA_KEY_GROUPS, {})
+        for group_id_str, group_dict in groups.items():
+            group_id = int(group_id_str)
+            self._groups[group_id] = MatterGroupInfo(**group_dict)
+        LOGGER.info("Loaded %s groups from stored configuration", len(self._groups))
+
+        # Always initialize the controller with test group info and keys
+        # so group commands work out of the box for most users.
+        try:
+            await self._chip_device_controller.init_group_testing_data()
+        except Exception as err:  # noqa: BLE001, pylint: disable=broad-except
+            LOGGER.warning("Failed to initialize group testing data: %s", err)
+
         # load nodes from persistent storage
         nodes: dict[str, dict | None] = self.server.storage.get(DATA_KEY_NODES, {})
         orphaned_nodes: set[str] = set()
@@ -353,6 +372,8 @@ class MatterDeviceController:
                         setup_pin_code,
                         discriminator,
                         is_short_discriminator,
+                        wifi_credentials=self._wifi_credentials,
+                        thread_dataset=self._thread_dataset,
                     )
                 )
             else:
@@ -523,6 +544,7 @@ class MatterDeviceController:
         """Set WiFi credentials for commissioning to a (new) device."""
 
         await self._chip_device_controller.set_wifi_credentials(ssid, credentials)
+        self._wifi_credentials = (ssid, credentials)
         self._wifi_credentials_set = True
         self.server.signal_event(EventType.SERVER_INFO_UPDATED, self.server.get_info())
 
@@ -531,6 +553,7 @@ class MatterDeviceController:
         """Set Thread Operational dataset in the stack."""
 
         await self._chip_device_controller.set_thread_operational_dataset(dataset)
+        self._thread_dataset = dataset
         self._thread_credentials_set = True
         self.server.signal_event(EventType.SERVER_INFO_UPDATED, self.server.get_info())
 
@@ -1056,6 +1079,11 @@ class MatterDeviceController:
         # TODO: Implement key management first if needed
         # For now we rely on the controller having test keys initialized
         # which can be done via the init_group_testing_data command.
+
+        # update our local registry if the group is new
+        if group_id not in self._groups:
+            self.add_group(group_id, group_name)
+
         await self._chip_device_controller.send_command(
             node_id,
             endpoint,
@@ -1080,6 +1108,25 @@ class MatterDeviceController:
             Clusters.Groups.Commands.GetGroupMembership([]),
         )
         return cast(list[int], read_result.groupList)
+
+    @api_command(APICommand.GET_GROUPS)
+    def get_groups(self) -> list[MatterGroupInfo]:
+        """Return all groups in the server registry."""
+        return list(self._groups.values())
+
+    @api_command(APICommand.ADD_GROUP)
+    def add_group(self, group_id: int, group_name: str) -> MatterGroupInfo:
+        """Add a group to the server registry."""
+        group = MatterGroupInfo(group_id=group_id, group_name=group_name)
+        self._groups[group_id] = group
+        self.server.storage.set(DATA_KEY_GROUPS, group, subkey=str(group_id))
+        return group
+
+    @api_command(APICommand.REMOVE_GROUP)
+    def remove_group(self, group_id: int) -> None:
+        """Remove a group from the server registry."""
+        self._groups.pop(group_id, None)
+        self.server.storage.remove(DATA_KEY_GROUPS, subkey=str(group_id))
 
     @api_command(APICommand.GROUP_SEND_COMMAND)
     async def send_group_command(
