@@ -116,7 +116,11 @@ class WebsocketClientHandler:
                     disconnect_warn = f"Received invalid JSON: {msg.data}"
                     break
 
-                self._logger.log(VERBOSE_LOG_LEVEL, "Received %s", command_msg)
+                self._logger.debug(
+                    "Received command %s with args: %s",
+                    command_msg.command,
+                    command_msg.args,
+                )
                 self._handle_command(command_msg)
 
         except asyncio.CancelledError:

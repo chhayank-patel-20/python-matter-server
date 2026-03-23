@@ -562,6 +562,15 @@ class MatterDeviceController:
         # ensure list
         if not isinstance(sdk_result, list):
             sdk_result = [sdk_result]
+
+        # Ensure all items are awaited if they are coroutines
+        resolved_results = []
+        for x in sdk_result:
+            if asyncio.iscoroutine(x):
+                resolved_results.append(await x)
+            else:
+                resolved_results.append(x)
+
         return [
             CommissionableNodeData(
                 instance_name=x.instanceName,
@@ -582,7 +591,7 @@ class MatterDeviceController:
                 addresses=x.addresses,
                 rotating_id=x.rotatingId,
             )
-            for x in sdk_result
+            for x in resolved_results
         ]
 
     async def _interview_node(self, node_id: int) -> None:

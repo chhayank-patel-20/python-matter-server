@@ -9,6 +9,10 @@
   - Fixes a mismatch with the dashboard (which was already using the longer name).
   - Provides a more descriptive and unambiguous command name.
 
-### 2. Wrap DiscoverCommissionableNodes in SDK executor
-- **Decision**: Changed `discover_commissionable_nodes` in `sdk.py` to use `await self._call_sdk(...)` instead of direct `await`.
-- **Rationale**: The native SDK's `DiscoverCommissionableNodes` is synchronous and returns a list. Awaiting it directly caused a `TypeError`. Using `_call_sdk` offloads it to a thread pool, preventing event loop blocking.
+### 3. Log incoming command payloads
+- **Decision**: Added `self._logger.debug("Received command %s with args: %s", command_msg.command, command_msg.args)` in `WebsocketClientHandler`.
+- **Rationale**: Facilitates debugging by providing visibility into the exact payloads sent by clients.
+
+### 4. Fix AttributeError in discovery
+- **Decision**: Added explicit `await` for each item in the SDK discovery result if it's a coroutine.
+- **Rationale**: The underlying CHIP SDK's `DiscoverCommissionableNodes` might return a list of coroutines (or objects that need to be awaited). Manually resolving them prevents `AttributeError: 'coroutine' object has no attribute 'instanceName'`.
