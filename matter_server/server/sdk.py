@@ -137,6 +137,7 @@ class ChipDeviceControllerWrapper:
         setup_payload: str,
         discovery_type: DiscoveryType,
         discriminator: int | None = None,
+        is_short_discriminator: bool = False,
     ) -> int:
         """Commission a device using a QR Code or Manual Pairing Code."""
         kwargs = {
@@ -146,6 +147,7 @@ class ChipDeviceControllerWrapper:
         }
         if discriminator is not None:
             kwargs["discriminator"] = discriminator
+            kwargs["isShortDiscriminator"] = is_short_discriminator
 
         return cast(
             int,

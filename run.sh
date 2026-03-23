@@ -31,4 +31,4 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     (sleep 2 && open "http://localhost:$PORT") &
 fi
 
-python3 -m matter_server.server --bluetooth-adapter 0
+python3 -m matter_server.server --bluetooth-adapter 0 --log-level DEBUG

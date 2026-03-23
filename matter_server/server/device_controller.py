@@ -328,18 +328,7 @@ class MatterDeviceController:
             node_id,
         )
 
-        # Extract long discriminator from setup code if possible
-        discriminator: int | None = None
-        try:
-            payload = setup_payload.SetupPayload()
-            if code.startswith("MT:"):
-                payload.ParseQrCode(code)
-            else:
-                payload.ParseManualPairingCode(code)
-            discriminator = payload.long_discriminator
-            LOGGER.debug("Extracted discriminator from setup code: %s", discriminator)
-        except (ValueError, ChipStackError) as err:
-            LOGGER.warning("Failed to extract discriminator from setup code: %s", err)
+        discriminator, is_short_discriminator = self._extract_discriminator(code)
 
         try:
             commissioned_node_id: int = (
@@ -350,6 +339,7 @@ class MatterDeviceController:
                     if network_only
                     else DiscoveryType.DISCOVERY_ALL,
                     discriminator=discriminator,
+                    is_short_discriminator=is_short_discriminator,
                 )
             )
             # We use SDK default behavior which always uses the commissioning Node ID in the
@@ -387,13 +377,40 @@ class MatterDeviceController:
                 await asyncio.sleep(5)
             else:
                 break
-
         # make sure we start a subscription for this newly added node
         if task := self._setup_node_create_task(node_id):
             await task
         LOGGER.info("Commissioning of Node ID %s completed.", node_id)
         # return full node object once we're complete
         return self.get_node(node_id)
+
+    def _extract_discriminator(self, code: str) -> tuple[int | None, bool]:
+        """Extract discriminator from setup code (QR or manual)."""
+        discriminator: int | None = None
+        is_short_discriminator = False
+        try:
+            payload = setup_payload.SetupPayload()
+            if code.startswith("MT:"):
+                payload.ParseQrCode(code)
+            else:
+                payload.ParseManualPairingCode(code)
+
+            if payload.long_discriminator is not None:
+                discriminator = payload.long_discriminator
+                is_short_discriminator = False
+            elif payload.short_discriminator is not None:
+                discriminator = payload.short_discriminator
+                is_short_discriminator = True
+
+            LOGGER.debug(
+                "Extracted %s discriminator from setup code: %s",
+                "short" if is_short_discriminator else "long",
+                discriminator,
+            )
+        except (ValueError, ChipStackError) as err:
+            LOGGER.warning("Failed to extract discriminator from setup code: %s", err)
+
+        return discriminator, is_short_discriminator
 
     @api_command(APICommand.COMMISSION_ON_NETWORK)
     async def commission_on_network(
