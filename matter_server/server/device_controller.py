@@ -591,6 +591,8 @@ class MatterDeviceController:
             elif x is not None:
                 resolved_results.append(x)
 
+        LOGGER.debug("Resolved discovery results: %s", resolved_results)
+
         return [
             CommissionableNodeData(
                 instance_name=x.instanceName,

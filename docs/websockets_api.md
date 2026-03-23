@@ -72,6 +72,30 @@ Discover Commissionable Nodes (discovered on BLE or mDNS). Returns the current l
 }
 ```
 
+**Example Response:**
+
+```json
+{
+  "message_id": "1",
+  "result": [
+    {
+      "instance_name": "...",
+      "host_name": "...",
+      "port": 5540,
+      "long_discriminator": 1234,
+      "vendor_id": 1,
+      "product_id": 1,
+      "commissioning_mode": 1,
+      "device_type": 1,
+      "device_name": "My Device",
+      "pairing_instruction": "...",
+      "pairing_hint": 1,
+      "addresses": ["192.168.1.100"]
+    }
+  ]
+}
+```
+
 If the command fails due to internal errors (e.g. `object list can't be used in 'await' expression`), it will return an ErrorResultMessage.
 
 **Set WiFi credentials**

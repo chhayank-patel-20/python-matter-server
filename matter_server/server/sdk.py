@@ -99,7 +99,17 @@ class ChipDeviceControllerWrapper:
         *args: Any,
         **kwargs: Any,
     ) -> _T:
-        return await self._call_sdk_executor(None, target, *args, **kwargs)
+        """Call function on the SDK and return result.
+
+        If it's a synchronous function, it will be called in an executor.
+        """
+        if asyncio.iscoroutinefunction(target):
+            return cast(_T, await target(*args, **kwargs))
+
+        result = await self._call_sdk_executor(None, target, *args, **kwargs)
+        if asyncio.iscoroutine(result):
+            return cast(_T, await result)
+        return result
 
     @lru_cache(maxsize=1024)  # noqa: B019
     def get_node_logger(
