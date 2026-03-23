@@ -48,3 +48,7 @@
 ### 2. APIs for Node-side Group Key Management
 - **Decision**: Implemented `group_add_key_set` and `group_bind_key_set` API commands.
 - **Rationale**: Real Matter devices do not come with test group keys by default. To make group commands work with real hardware, the user must be able to program the node's `GroupKeyManagement` cluster. These new APIs allow the user to install keysets and map group IDs to those keysets on any commissioned node.
+
+### 3. Documented Group ID Limitations in Test Mode
+- **Decision**: Added documentation explaining that `init_group_testing_data` typically only supports Group IDs `257` (0x0101) and `258` (0x0102) for the controller.
+- **Rationale**: The SDK's built-in test data is hardcoded to specific Group IDs. Users using IDs like `1` or `2` will receive `0xAC` because the controller lacks keys for those IDs. Explicit documentation and an improved error message guide the user to working IDs.

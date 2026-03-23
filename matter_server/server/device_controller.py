@@ -1152,7 +1152,16 @@ class MatterDeviceController:
                 "Attempting to re-initialize group testing data and retrying..."
             )
             await self._chip_device_controller.init_group_testing_data()
-            await self._chip_device_controller.send_group_command(group_id, command)
+            try:
+                await self._chip_device_controller.send_group_command(group_id, command)
+            except ChipStackError as retry_err:
+                if retry_err.err == 0xAC:
+                    raise InvalidArguments(
+                        f"Group command failed with 0xAC (Internal Error) for group_id {group_id}. "
+                        "This typically means the group ID is not supported by the current "
+                        "test group keys. Try using group_id 257 (0x0101) or 258 (0x0102)."
+                    ) from retry_err
+                raise
 
     @api_command(APICommand.GET_FABRICS)
     async def get_fabrics(self, node_id: int) -> list[MatterFabricInfo]:

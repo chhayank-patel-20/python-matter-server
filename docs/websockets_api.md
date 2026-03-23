@@ -381,19 +381,24 @@ Get all groups a node's endpoint belongs to.
 
 Send a command to a group of nodes.
 Note: If the command fails with "Internal Error (0xAC)", the server will automatically attempt to re-initialize group testing data and retry once.
+**Important for Development/Test Mode:** The standard test keys initialized by `init_group_testing_data` typically only support specific Group IDs, such as `257` (0x0101) and `258` (0x0102). Using Group IDs like `1` or `2` may result in `Internal Error (0xAC)`.
 
 ```json
 {
   "message_id": "1",
   "command": "group_send_command",
   "args": {
-    "group_id": 1,
+    "group_id": 257,
     "cluster_id": 6,
     "command_name": "On",
     "payload": {}
   }
 }
 ```
+
+**Common Errors during Group Commands:**
+- `CHIP Error 0xAC (Internal Error)`: The controller doesn't have the group keys for the specified group ID. Ensure you use supported group IDs (e.g., 257) or correctly program the controller's keys.
+- `CHIP Error 0x32 (Timeout)`: Operational discovery of one or more nodes in the group failed. This means the node is unreachable on the network or its mDNS record could not be found. Check if the device is powered on and connected to the same network.
 
 **Group Add Key Set**
 
