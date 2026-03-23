@@ -25,6 +25,7 @@ from chip.clusters.ClusterObjects import ALL_ATTRIBUTES, ALL_CLUSTERS, Cluster
 from chip.discovery import DiscoveryType
 from chip.exceptions import ChipStackError
 from chip.native import PyChipError
+from chip.setup_payload import setup_payload
 from zeroconf import (
     BadTypeInNameException,
     DNSQuestionType,
@@ -326,6 +327,20 @@ class MatterDeviceController:
             "Starting Matter commissioning with code using Node ID %s.",
             node_id,
         )
+
+        # Extract long discriminator from setup code if possible
+        discriminator: int | None = None
+        try:
+            payload = setup_payload.SetupPayload()
+            if code.startswith("MT:"):
+                payload.ParseQrCode(code)
+            else:
+                payload.ParseManualPairingCode(code)
+            discriminator = payload.long_discriminator
+            LOGGER.debug("Extracted discriminator from setup code: %s", discriminator)
+        except (ValueError, ChipStackError) as err:
+            LOGGER.warning("Failed to extract discriminator from setup code: %s", err)
+
         try:
             commissioned_node_id: int = (
                 await self._chip_device_controller.commission_with_code(
@@ -334,6 +349,7 @@ class MatterDeviceController:
                     DiscoveryType.DISCOVERY_NETWORK_ONLY
                     if network_only
                     else DiscoveryType.DISCOVERY_ALL,
+                    discriminator=discriminator,
                 )
             )
             # We use SDK default behavior which always uses the commissioning Node ID in the

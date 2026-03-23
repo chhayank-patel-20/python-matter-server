@@ -126,15 +126,20 @@ class ChipDeviceControllerWrapper:
         node_id: int,
         setup_payload: str,
         discovery_type: DiscoveryType,
+        discriminator: int | None = None,
     ) -> int:
         """Commission a device using a QR Code or Manual Pairing Code."""
+        kwargs = {
+            "setupPayload": setup_payload,
+            "nodeid": node_id,
+            "discoveryType": discovery_type,
+        }
+        if discriminator is not None:
+            kwargs["discriminator"] = discriminator
+
         return cast(
             int,
-            await self._chip_controller.CommissionWithCode(
-                setupPayload=setup_payload,
-                nodeid=node_id,
-                discoveryType=discovery_type,
-            ),
+            await self._chip_controller.CommissionWithCode(**kwargs),
         )
 
     async def commission_on_network(

@@ -16,3 +16,7 @@
 ### 4. Fix AttributeError in discovery (coroutine and list objects)
 - **Decision**: Added explicit resolution for both coroutines and nested lists in the SDK discovery result.
 - **Rationale**: The underlying CHIP SDK's `DiscoverCommissionableNodes` might return a single node, a list of nodes, or a list of coroutines/objects that resolve to nodes or lists of nodes. The updated logic robustly flattens and awaits these results to prevent `AttributeError` for both `'coroutine'` and `'list'` objects.
+
+### 5. Fix "Long discriminator is required" error during commissioning
+- **Decision**: Added automatic extraction of the long discriminator from the setup code (QR or manual) using `chip.setup_payload.setup_payload.SetupPayload`.
+- **Rationale**: The CHIP SDK's `CommissionWithCode` requires a discriminator when searching for a device via BLE or mDNS. By extracting it from the setup code, we provide the necessary information to the SDK, resolving the `Invalid argument` error and enabling successful discovery of the commissionable node.
