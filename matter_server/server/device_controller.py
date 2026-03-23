@@ -1140,7 +1140,19 @@ class MatterDeviceController:
         cluster_cls: Cluster = ALL_CLUSTERS[cluster_id]
         command_cls = getattr(cluster_cls.Commands, command_name)
         command = dataclass_from_dict(command_cls, payload, allow_sdk_types=True)
-        await self._chip_device_controller.send_group_command(group_id, command)
+        try:
+            await self._chip_device_controller.send_group_command(group_id, command)
+        except ChipStackError as err:
+            # 0xAC is CHIP_ERROR_INTERNAL, which often means group keys are missing
+            # for the current fabric on the controller.
+            if err.err != 0xAC:
+                raise
+            LOGGER.warning(
+                "Group command failed with 0xAC (Internal Error). "
+                "Attempting to re-initialize group testing data and retrying..."
+            )
+            await self._chip_device_controller.init_group_testing_data()
+            await self._chip_device_controller.send_group_command(group_id, command)
 
     @api_command(APICommand.GET_FABRICS)
     async def get_fabrics(self, node_id: int) -> list[MatterFabricInfo]:
@@ -1186,6 +1198,69 @@ class MatterDeviceController:
             node_id,
             0,
             Clusters.OperationalCredentials.Commands.UpdateFabricLabel(label=label),
+        )
+
+    @api_command(APICommand.GROUP_ADD_KEY_SET)
+    async def group_add_key_set(
+        self,
+        node_id: int,
+        keyset_id: int,
+        key_hex: str = "0102030405060708090a0b0c0d0e0f10",
+    ) -> None:
+        """Add a group key set to a node."""
+        key = bytes.fromhex(key_hex)
+        await self._chip_device_controller.send_command(
+            node_id=node_id,
+            endpoint_id=0,
+            command=Clusters.GroupKeyManagement.Commands.KeySetWrite(
+                groupKeySet=Clusters.GroupKeyManagement.Structs.GroupKeySetStruct(
+                    groupKeySetID=keyset_id,
+                    groupKeySecurityPolicy=Clusters.GroupKeyManagement.Enums.GroupKeySecurityPolicyEnum.kTrustFirst,
+                    epochKey0=key,
+                    epochStartTime0=0,
+                )
+            ),
+        )
+
+    @api_command(APICommand.GROUP_BIND_KEY_SET)
+    async def group_bind_key_set(
+        self,
+        node_id: int,
+        group_id: int,
+        keyset_id: int,
+    ) -> None:
+        """Bind a group ID to a keyset ID on a node."""
+        # Get existing mappings first
+        read_result = await self._chip_device_controller.read_attribute(
+            node_id=node_id,
+            attributes=[(0, Clusters.GroupKeyManagement.Attributes.GroupKeyMap)],
+        )
+        if read_result is None or read_result.attributes is None:
+            return
+        current_map: list[Clusters.GroupKeyManagement.Structs.GroupKeyMapStruct] = (
+            read_result.attributes[0][Clusters.GroupKeyManagement][
+                Clusters.GroupKeyManagement.Attributes.GroupKeyMap
+            ]
+        )
+
+        # Add or update mapping
+        new_map = [m for m in current_map if m.groupId != group_id]
+        new_map.append(
+            Clusters.GroupKeyManagement.Structs.GroupKeyMapStruct(
+                groupId=group_id,
+                groupKeySetID=keyset_id,
+                fabricIndex=0,  # SDK will fill this in
+            )
+        )
+
+        await self._chip_device_controller.write_attribute(
+            node_id=node_id,
+            attributes=[
+                (
+                    0,
+                    Clusters.GroupKeyManagement.Attributes.GroupKeyMap(new_map),
+                )
+            ],
         )
 
     @api_command(APICommand.INIT_GROUP_TESTING_DATA)

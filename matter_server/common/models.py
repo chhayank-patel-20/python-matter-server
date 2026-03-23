@@ -67,6 +67,8 @@ class APICommand(StrEnum):
     GET_GROUPS = "get_groups"
     ADD_GROUP = "add_group"
     REMOVE_GROUP = "remove_group"
+    GROUP_ADD_KEY_SET = "group_add_key_set"
+    GROUP_BIND_KEY_SET = "group_bind_key_set"
     INIT_GROUP_TESTING_DATA = "init_group_testing_data"
 
 

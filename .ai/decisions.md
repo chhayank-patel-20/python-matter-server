@@ -38,3 +38,13 @@
 ### 3. Sync node group membership with server registry
 - **Decision**: Updated `group_add` to automatically add a group to the server-side registry if it doesn't already exist.
 - **Rationale**: Ensures consistency between what's configured on nodes and what's known to the server.
+
+## 2026-03-23: Robust Group Management and 0xAC Error Handling
+
+### 1. Automatic Retry for CHIP Error 0xAC (Internal Error)
+- **Decision**: Added a try-except block in `send_group_command` that catches `ChipStackError` with error code `0xAC`. Upon catching this error, the server calls `init_group_testing_data()` and retries the command once.
+- **Rationale**: `0xAC` (CHIP_ERROR_INTERNAL) often occurs in `SendGroupCommand` if the controller's `GroupDataProvider` doesn't have keys for the current fabric. Re-initializing the testing data before retrying provides a self-healing mechanism for environments where the fabric state might have changed.
+
+### 2. APIs for Node-side Group Key Management
+- **Decision**: Implemented `group_add_key_set` and `group_bind_key_set` API commands.
+- **Rationale**: Real Matter devices do not come with test group keys by default. To make group commands work with real hardware, the user must be able to program the node's `GroupKeyManagement` cluster. These new APIs allow the user to install keysets and map group IDs to those keysets on any commissioned node.

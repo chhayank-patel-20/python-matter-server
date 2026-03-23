@@ -380,6 +380,7 @@ Get all groups a node's endpoint belongs to.
 **Group Send Command**
 
 Send a command to a group of nodes.
+Note: If the command fails with "Internal Error (0xAC)", the server will automatically attempt to re-initialize group testing data and retry once.
 
 ```json
 {
@@ -390,6 +391,39 @@ Send a command to a group of nodes.
     "cluster_id": 6,
     "command_name": "On",
     "payload": {}
+  }
+}
+```
+
+**Group Add Key Set**
+
+Add a group key set to a node. This is required for real devices to receive group commands.
+Standard test key (if omitted): `0102030405060708090a0b0c0d0e0f10`
+
+```json
+{
+  "message_id": "1",
+  "command": "group_add_key_set",
+  "args": {
+    "node_id": 1,
+    "keyset_id": 1,
+    "key_hex": "0102030405060708090a0b0c0d0e0f10"
+  }
+}
+```
+
+**Group Bind Key Set**
+
+Bind a group ID to a keyset ID on a node.
+
+```json
+{
+  "message_id": "1",
+  "command": "group_bind_key_set",
+  "args": {
+    "node_id": 1,
+    "group_id": 1,
+    "keyset_id": 1
   }
 }
 ```
