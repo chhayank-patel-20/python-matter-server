@@ -13,6 +13,6 @@
 - **Decision**: Added `self._logger.debug("Received command %s with args: %s", command_msg.command, command_msg.args)` in `WebsocketClientHandler`.
 - **Rationale**: Facilitates debugging by providing visibility into the exact payloads sent by clients.
 
-### 4. Fix AttributeError in discovery
-- **Decision**: Added explicit `await` for each item in the SDK discovery result if it's a coroutine.
-- **Rationale**: The underlying CHIP SDK's `DiscoverCommissionableNodes` might return a list of coroutines (or objects that need to be awaited). Manually resolving them prevents `AttributeError: 'coroutine' object has no attribute 'instanceName'`.
+### 4. Fix AttributeError in discovery (coroutine and list objects)
+- **Decision**: Added explicit resolution for both coroutines and nested lists in the SDK discovery result.
+- **Rationale**: The underlying CHIP SDK's `DiscoverCommissionableNodes` might return a single node, a list of nodes, or a list of coroutines/objects that resolve to nodes or lists of nodes. The updated logic robustly flattens and awaits these results to prevent `AttributeError` for both `'coroutine'` and `'list'` objects.

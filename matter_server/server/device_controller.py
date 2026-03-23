@@ -557,18 +557,22 @@ class MatterDeviceController:
     ) -> list[CommissionableNodeData]:
         """Discover Commissionable Nodes (discovered on BLE or mDNS)."""
         sdk_result = await self._chip_device_controller.discover_commissionable_nodes()
+        LOGGER.debug("SDK discovery result: %s", sdk_result)
         if sdk_result is None:
             return []
         # ensure list
         if not isinstance(sdk_result, list):
             sdk_result = [sdk_result]
 
-        # Ensure all items are awaited if they are coroutines
+        # Ensure all items are awaited if they are coroutines and flatten results
         resolved_results = []
         for x in sdk_result:
             if asyncio.iscoroutine(x):
-                resolved_results.append(await x)
-            else:
+                x = await x
+
+            if isinstance(x, list):
+                resolved_results.extend(x)
+            elif x is not None:
                 resolved_results.append(x)
 
         return [
