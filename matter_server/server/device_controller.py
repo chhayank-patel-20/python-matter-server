@@ -328,20 +328,43 @@ class MatterDeviceController:
             node_id,
         )
 
-        discriminator, is_short_discriminator = self._extract_discriminator(code)
+        discriminator, is_short_discriminator, setup_pin_code = (
+            self._extract_discriminator(code)
+        )
 
         try:
-            commissioned_node_id: int = (
-                await self._chip_device_controller.commission_with_code(
+            if (
+                discriminator is not None
+                and setup_pin_code is not None
+                and not network_only
+            ):
+                # If we have a discriminator and not network_only, we try BLE commissioning directly
+                # as the SDK's CommissionWithCode sometimes fails to find the device over BLE
+                # without an explicit discriminator.
+                LOGGER.info(
+                    "Attempting BLE commissioning for node %s using %s discriminator %s",
                     node_id,
-                    code,
-                    DiscoveryType.DISCOVERY_NETWORK_ONLY
-                    if network_only
-                    else DiscoveryType.DISCOVERY_ALL,
-                    discriminator=discriminator,
-                    is_short_discriminator=is_short_discriminator,
+                    "short" if is_short_discriminator else "long",
+                    discriminator,
                 )
-            )
+                commissioned_node_id = (
+                    await self._chip_device_controller.commission_ble(
+                        node_id,
+                        setup_pin_code,
+                        discriminator,
+                        is_short_discriminator,
+                    )
+                )
+            else:
+                commissioned_node_id = (
+                    await self._chip_device_controller.commission_with_code(
+                        node_id,
+                        code,
+                        DiscoveryType.DISCOVERY_NETWORK_ONLY
+                        if network_only
+                        else DiscoveryType.DISCOVERY_ALL,
+                    )
+                )
             # We use SDK default behavior which always uses the commissioning Node ID in the
             # generated NOC. So this should be the same really.
             LOGGER.info("Commissioned Node ID: %s vs %s", commissioned_node_id, node_id)
@@ -384,10 +407,11 @@ class MatterDeviceController:
         # return full node object once we're complete
         return self.get_node(node_id)
 
-    def _extract_discriminator(self, code: str) -> tuple[int | None, bool]:
-        """Extract discriminator from setup code (QR or manual)."""
+    def _extract_discriminator(self, code: str) -> tuple[int | None, bool, int | None]:
+        """Extract discriminator and pin from setup code (QR or manual)."""
         discriminator: int | None = None
         is_short_discriminator = False
+        setup_pin_code: int | None = None
         try:
             payload = setup_payload.SetupPayload()
             if code.startswith("MT:"):
@@ -402,15 +426,18 @@ class MatterDeviceController:
                 discriminator = payload.short_discriminator
                 is_short_discriminator = True
 
+            setup_pin_code = payload.setup_passcode
+
             LOGGER.debug(
-                "Extracted %s discriminator from setup code: %s",
+                "Extracted %s discriminator (%s) and PIN (%s) from setup code",
                 "short" if is_short_discriminator else "long",
                 discriminator,
+                setup_pin_code,
             )
         except (ValueError, ChipStackError) as err:
             LOGGER.warning("Failed to extract discriminator from setup code: %s", err)
 
-        return discriminator, is_short_discriminator
+        return discriminator, is_short_discriminator, setup_pin_code
 
     @api_command(APICommand.COMMISSION_ON_NETWORK)
     async def commission_on_network(

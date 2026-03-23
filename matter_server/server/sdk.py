@@ -136,22 +136,33 @@ class ChipDeviceControllerWrapper:
         node_id: int,
         setup_payload: str,
         discovery_type: DiscoveryType,
-        discriminator: int | None = None,
-        is_short_discriminator: bool = False,
     ) -> int:
         """Commission a device using a QR Code or Manual Pairing Code."""
-        kwargs = {
-            "setupPayload": setup_payload,
-            "nodeid": node_id,
-            "discoveryType": discovery_type,
-        }
-        if discriminator is not None:
-            kwargs["discriminator"] = discriminator
-            kwargs["isShortDiscriminator"] = is_short_discriminator
-
         return cast(
             int,
-            await self._chip_controller.CommissionWithCode(**kwargs),
+            await self._chip_controller.CommissionWithCode(
+                setupPayload=setup_payload,
+                nodeid=node_id,
+                discoveryType=discovery_type,
+            ),
+        )
+
+    async def commission_ble(
+        self,
+        node_id: int,
+        setup_pin_code: int,
+        discriminator: int,
+        is_short_discriminator: bool = False,
+    ) -> int:
+        """Commission a device over BLE."""
+        return cast(
+            int,
+            await self._chip_controller.ConnectBLE(
+                discriminator=discriminator,
+                setupPinCode=setup_pin_code,
+                nodeid=node_id,
+                isShortDiscriminator=is_short_discriminator,
+            ),
         )
 
     async def commission_on_network(

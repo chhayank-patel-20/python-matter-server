@@ -18,5 +18,5 @@
 - **Rationale**: The underlying CHIP SDK's `DiscoverCommissionableNodes` might return a single node, a list of nodes, or a list of coroutines/objects that resolve to nodes or lists of nodes. The updated logic robustly flattens and awaits these results to prevent `AttributeError` for both `'coroutine'` and `'list'` objects.
 
 ### 5. Fix "Long discriminator is required" error during commissioning
-- **Decision**: Added automatic extraction of the discriminator from the setup code (QR or manual) using `chip.setup_payload.setup_payload.SetupPayload`. The logic now supports both long and short discriminators.
-- **Rationale**: The CHIP SDK's `CommissionWithCode` requires a discriminator when searching for a device via BLE or mDNS. Manual pairing codes often only contain a short discriminator. By extracting whichever is available (long or short) and passing it to the SDK with the correct `isShortDiscriminator` flag, we ensure the SDK has the necessary information to find the device.
+- **Decision**: Implemented a fallback mechanism that uses `ChipDeviceController.ConnectBLE` (via a new `commission_ble` SDK wrapper) when a discriminator is extracted from the setup code.
+- **Rationale**: The SDK's standard `CommissionWithCode` does not accept an explicit discriminator as an argument, which can cause discovery to fail over BLE (e.g., "Long discriminator is required" or timeouts). By extracting the discriminator and PIN from the setup code and using `ConnectBLE` directly, we provide the SDK with the exact parameters it needs for successful discovery and pairing.
