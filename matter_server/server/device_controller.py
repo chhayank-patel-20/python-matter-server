@@ -197,7 +197,18 @@ class MatterDeviceController:
 
     async def start(self) -> None:
         """Handle logic on controller start."""
-        # load groups from persistent storage
+        # Initialize test group data FIRST so that our custom key injection
+        # (below) can prepend to the FabricData linked lists C++ just wrote.
+        # If this runs AFTER _ensure_controller_group_keys, the C++ call
+        # overwrites FabricData and orphans our custom group entries, causing
+        # CHIP Error 0x000000AC (Internal error) on every SendGroupCommand.
+        try:
+            await self._chip_device_controller.init_group_testing_data()
+        except Exception as err:  # noqa: BLE001, pylint: disable=broad-except
+            LOGGER.warning("Failed to initialize group testing data: %s", err)
+
+        # Load groups from persistent storage and inject custom keys AFTER
+        # init_group_testing_data so our FabricData update is not overwritten.
         groups: dict[str, dict] = self.server.storage.get(DATA_KEY_GROUPS, {})
         for group_id_str, group_dict in groups.items():
             group_id = int(group_id_str)
@@ -209,13 +220,6 @@ class MatterDeviceController:
             self._overwrite_controller_keyset(group_info)
             self._ensure_controller_group_keys(group_info)
         LOGGER.info("Loaded %s groups from stored configuration", len(self._groups))
-
-        # We no longer strictly need init_group_testing_data since we have custom keys,
-        # but keep it as a fallback or for backwards compatibility.
-        try:
-            await self._chip_device_controller.init_group_testing_data()
-        except Exception as err:  # noqa: BLE001, pylint: disable=broad-except
-            LOGGER.warning("Failed to initialize group testing data: %s", err)
 
         # load nodes from persistent storage
         nodes: dict[str, dict | None] = self.server.storage.get(DATA_KEY_NODES, {})
