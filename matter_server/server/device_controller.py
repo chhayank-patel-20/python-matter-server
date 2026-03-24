@@ -26,7 +26,7 @@ from chip.discovery import DiscoveryType
 from chip.exceptions import ChipStackError
 from chip.native import PyChipError
 from chip.setup_payload import setup_payload
-from chip.tlv import TLVReader, TLVWriter
+from chip.tlv import TLVReader, TLVWriter, uint as tlv_uint
 from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from zeroconf import (
@@ -1202,14 +1202,14 @@ class MatterDeviceController:
             writer.put(
                 None,
                 {
-                    1: 1,  # policy: kCacheAndSync
-                    2: 1,  # keys_count
+                    1: tlv_uint(1),  # policy: kCacheAndSync
+                    2: tlv_uint(1),  # keys_count
                     3: [
-                        {4: 0, 5: session_id, 6: encryption_key},
-                        {4: 0, 5: 0, 6: zeroed_key},
-                        {4: 0, 5: 0, 6: zeroed_key},
+                        {4: tlv_uint(0), 5: tlv_uint(session_id), 6: encryption_key},
+                        {4: tlv_uint(0), 5: tlv_uint(0), 6: zeroed_key},
+                        {4: tlv_uint(0), 5: tlv_uint(0), 6: zeroed_key},
                     ],
-                    7: old_next,
+                    7: tlv_uint(old_next),
                 },
             )
             storage.SetSdkKey(keyset_key_name, writer.encoding)
@@ -1278,13 +1278,13 @@ class MatterDeviceController:
             if fabric_data_raw is None:
                 # Initialize with SDK defaults (kInvalidKeysetId/kUndefinedGroupId)
                 fabric_data = {
-                    1: 0,  # first_group (0 = kUndefinedGroupId)
-                    2: 0,  # group_count
-                    3: 0,  # first_map
-                    4: 0,  # map_count
-                    5: invalid_id,  # first_keyset (0xFFFF = kInvalidKeysetId)
-                    6: 0,  # keyset_count
-                    7: 0,  # next fabric index (0 = kUndefinedFabricIndex)
+                    1: tlv_uint(0),  # first_group (0 = kUndefinedGroupId)
+                    2: tlv_uint(0),  # group_count
+                    3: tlv_uint(0),  # first_map
+                    4: tlv_uint(0),  # map_count
+                    5: tlv_uint(invalid_id),  # first_keyset (0xFFFF = kInvalidKeysetId)
+                    6: tlv_uint(0),  # keyset_count
+                    7: tlv_uint(0),  # next fabric index (0 = kUndefinedFabricIndex)
                 }
             else:
                 fabric_data = TLVReader(fabric_data_raw).get()["Any"]
@@ -1302,14 +1302,14 @@ class MatterDeviceController:
                 None,
                 {
                     1: group.group_name[:16],  # name (max 16 chars)
-                    2: 0xFFFF,  # first_endpoint = kInvalidEndpointId
-                    3: 0,  # endpoint_count
-                    4: old_first_group,  # next group_id in linked list
+                    2: tlv_uint(0xFFFF),  # first_endpoint = kInvalidEndpointId
+                    3: tlv_uint(0),  # endpoint_count
+                    4: tlv_uint(old_first_group),  # next group_id in linked list
                 },
             )
             storage.SetSdkKey(group_key_name, writer.encoding)
-            fabric_data[1] = group.group_id
-            fabric_data[2] = old_group_count + 1
+            fabric_data[1] = tlv_uint(group.group_id)
+            fabric_data[2] = tlv_uint(old_group_count + 1)
 
             # 3. Write Keyset (tags: 1=policy, 2=keys_count, 3=array[3], 7=next)
             # IMPORTANT: array must have EXACTLY 3 items (kEpochKeysMax).
@@ -1319,30 +1319,37 @@ class MatterDeviceController:
             writer.put(
                 None,
                 {
-                    1: 1,  # policy: kCacheAndSync
-                    2: 1,  # keys_count (1 active epoch key)
+                    1: tlv_uint(1),  # policy: kCacheAndSync
+                    2: tlv_uint(1),  # keys_count (1 active epoch key)
                     3: [
                         # slot 0 - our active key
-                        {4: 0, 5: session_id, 6: encryption_key},
+                        {4: tlv_uint(0), 5: tlv_uint(session_id), 6: encryption_key},
                         # slots 1 & 2 - unused, zeroed (required by kEpochKeysMax=3)
-                        {4: 0, 5: 0, 6: zeroed_key},
-                        {4: 0, 5: 0, 6: zeroed_key},
+                        {4: tlv_uint(0), 5: tlv_uint(0), 6: zeroed_key},
+                        {4: tlv_uint(0), 5: tlv_uint(0), 6: zeroed_key},
                     ],
-                    7: old_first_keyset,  # next keyset in linked list
+                    7: tlv_uint(old_first_keyset),  # next keyset in linked list
                 },
             )
             storage.SetSdkKey(keyset_key_name, writer.encoding)
-            fabric_data[5] = group.keyset_id
-            fabric_data[6] = old_keyset_count + 1
+            fabric_data[5] = tlv_uint(group.keyset_id)
+            fabric_data[6] = tlv_uint(old_keyset_count + 1)
 
             # 4. Write Map (tags: 1=group_id, 2=keyset_id, 3=next)
             map_id = secrets.randbelow(50000) + 10000
             map_key_name = f"f/{fabric_idx:x}/gk/{map_id:x}"
             writer = TLVWriter()
-            writer.put(None, {1: group.group_id, 2: group.keyset_id, 3: old_first_map})
+            writer.put(
+                None,
+                {
+                    1: tlv_uint(group.group_id),
+                    2: tlv_uint(group.keyset_id),
+                    3: tlv_uint(old_first_map),
+                },
+            )
             storage.SetSdkKey(map_key_name, writer.encoding)
-            fabric_data[3] = map_id
-            fabric_data[4] = old_map_count + 1
+            fabric_data[3] = tlv_uint(map_id)
+            fabric_data[4] = tlv_uint(old_map_count + 1)
 
             # 5. Save updated FabricData
             writer = TLVWriter()

@@ -74,16 +74,22 @@ def _global_loop_exception_handler(_: Any, context: dict[str, Any]) -> None:
     )
 
 
-def _cleanup_corrupted_keysets(storage_path: str, logger: logging.Logger) -> None:
-    """Remove malformed group keyset entries from chip.json before controller init.
+def _cleanup_corrupted_group_storage(storage_path: str, logger: logging.Logger) -> None:
+    """Remove all Python-written group TLV entries from chip.json before controller init.
 
-    The GroupDataProviderImpl C++ class reads keyset TLVs at controller
-    initialization time (SetSingleIpkEpochKey traverses the keyset linked list).
-    Any keyset entry that does not contain exactly 3 epoch key slots will cause
-    a CHIP Error 0x00000026 (Wrong TLV type) and prevent the server from
-    starting.  This function removes all non-IPK keyset entries so the C++
-    code sees a clean slate; they are recreated by the startup logic in
-    MatterDeviceController.start().
+    All group-related KVS entries that were written by our Python code used plain
+    Python int (signed TLV integers) instead of chip.tlv.uint (unsigned TLV integers).
+    C++ TLVReader::Get(uint16_t/uint8_t) rejects signed TLV elements with
+    CHIP Error 0x00000026 (Wrong TLV type), crashing NewController() on startup.
+
+    Affected key patterns (under chip.json "sdk-config"):
+      f/<fabric>/k/<id>   keyset entries  (id != 0 to preserve IPK)
+      f/<fabric>/g        FabricData header
+      f/<fabric>/g/<id>   per-group GroupInfo
+      f/<fabric>/gk/<id>  KeyMapData
+
+    All of these are recreated correctly (with tlv_uint values) by
+    MatterDeviceController.start() via _ensure_controller_group_keys().
     """
     chip_json_path = Path(storage_path) / "chip.json"
     if not chip_json_path.exists():
@@ -92,7 +98,7 @@ def _cleanup_corrupted_keysets(storage_path: str, logger: logging.Logger) -> Non
         with chip_json_path.open() as fh:
             data = json.load(fh)
     except (OSError, ValueError) as err:
-        logger.warning("Could not read chip.json for keyset cleanup: %s", err)
+        logger.warning("Could not read chip.json for group storage cleanup: %s", err)
         return
 
     # chip.json stores SDK keys under the nested "sdk-config" key.
@@ -100,11 +106,22 @@ def _cleanup_corrupted_keysets(storage_path: str, logger: logging.Logger) -> Non
     if not isinstance(sdk_config, dict):
         return
 
-    keyset_pattern = re.compile(r"^f/[0-9a-f]+/k/([0-9a-f]+)$")
+    # Match all group-related entries we may have written.
+    # Preserve the IPK keyset (f/<fabric>/k/0) and all non-group fabric entries.
+    non_ipk_keyset = re.compile(r"^f/[0-9a-f]+/k/([0-9a-f]+)$")
+    fabric_data = re.compile(r"^f/[0-9a-f]+/g$")
+    group_data = re.compile(r"^f/[0-9a-f]+/g/[0-9a-f]+$")
+    key_map_data = re.compile(r"^f/[0-9a-f]+/gk/[0-9a-f]+$")
+
     keys_to_delete = [
         key
         for key in sdk_config
-        if (match := keyset_pattern.match(key)) and int(match.group(1), 16) != 0
+        if (
+            ((m := non_ipk_keyset.match(key)) and int(m.group(1), 16) != 0)
+            or fabric_data.match(key)
+            or group_data.match(key)
+            or key_map_data.match(key)
+        )
     ]
     if not keys_to_delete:
         return
@@ -115,7 +132,7 @@ def _cleanup_corrupted_keysets(storage_path: str, logger: logging.Logger) -> Non
         with chip_json_path.open("w") as fh:
             json.dump(data, fh, ensure_ascii=True, indent=4)
         logger.info(
-            "Removed %d stale group keyset entries from storage (will be recreated at startup)",
+            "Removed %d stale group storage entries from chip.json (will be recreated at startup)",
             len(keys_to_delete),
         )
     except OSError as err:
@@ -229,9 +246,9 @@ class MatterServer:
             fetch_production_certificates=True,
         )
 
-        # Remove any malformed group keyset entries left by earlier buggy code
+        # Remove any malformed group storage entries left by earlier buggy code
         # before the CHIP controller is created (it crashes on malformed TLVs).
-        _cleanup_corrupted_keysets(self.storage_path, self.logger)
+        _cleanup_corrupted_group_storage(self.storage_path, self.logger)
 
         # Initialize our (intermediate) device controller which keeps track
         # of Matter devices and their subscriptions.
