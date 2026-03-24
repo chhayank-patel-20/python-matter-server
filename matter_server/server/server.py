@@ -95,20 +95,25 @@ def _cleanup_corrupted_keysets(storage_path: str, logger: logging.Logger) -> Non
         logger.warning("Could not read chip.json for keyset cleanup: %s", err)
         return
 
+    # chip.json stores SDK keys under the nested "sdk-config" key.
+    sdk_config = data.get("sdk-config", {})
+    if not isinstance(sdk_config, dict):
+        return
+
     keyset_pattern = re.compile(r"^f/[0-9a-f]+/k/([0-9a-f]+)$")
     keys_to_delete = [
         key
-        for key in data
+        for key in sdk_config
         if (match := keyset_pattern.match(key)) and int(match.group(1), 16) != 0
     ]
     if not keys_to_delete:
         return
 
     for key in keys_to_delete:
-        del data[key]
+        del sdk_config[key]
     try:
         with chip_json_path.open("w") as fh:
-            json.dump(data, fh)
+            json.dump(data, fh, ensure_ascii=True, indent=4)
         logger.info(
             "Removed %d stale group keyset entries from storage (will be recreated at startup)",
             len(keys_to_delete),
