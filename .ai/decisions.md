@@ -82,3 +82,7 @@ The previous TLV injection stored the raw epoch key as `TagKeyValue` (tag 6) and
 ### Bug 3: Missing startup migration for existing groups
 - **Decision**: Added `_overwrite_controller_keyset` method. Called in `start()` for every stored group before `_ensure_controller_group_keys`. It re-derives and overwrites the keyset KVS entry while preserving the linked-list `next` pointer.
 - **Rationale**: Existing groups stored with the old buggy code need their keyset KVS entry updated. The `_ensure_controller_group_keys` early-return guard prevented this fix from taking effect for already-stored groups.
+
+### Bug 4: Crash on startup when chip.json contains corrupted keysets from old code (Raspberry Pi deployment fix)
+- **Decision**: Added `_cleanup_corrupted_keysets(storage_path, logger)` in `server.py`, called before `MatterDeviceController` is instantiated in `start()`. It reads `chip.json` directly, finds all non-IPK keyset entries (`f/X/k/Y` where Y != 0), removes them, and saves the file.
+- **Rationale**: The buggy old code (1-item TLV array) left corrupted keyset entries in `chip.json`. On the next startup, `GroupDataProviderImpl.SetSingleIpkEpochKey` traverses the keyset linked list and hits the malformed TLV → `CHIP Error 0x00000026: Wrong TLV type` → server cannot start. By scrubbing these entries before `NewController()` is called, the C++ sees a clean linked list. The entries are recreated correctly by `MatterDeviceController.start()` via `_ensure_controller_group_keys`.
