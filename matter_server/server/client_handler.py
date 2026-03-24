@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 from aiohttp import WSMsgType, web
 from chip.exceptions import ChipStackError
+from chip.interaction_model import InteractionModelError
 
 from matter_server.common.const import VERBOSE_LOG_LEVEL
 from matter_server.common.helpers.json import json_dumps, json_loads
@@ -194,7 +195,7 @@ class WebsocketClientHandler:
             if asyncio.iscoroutine(result):
                 result = await result
             self._send_message(SuccessResultMessage(msg.message_id, result))
-        except (ChipStackError, MatterError) as err:
+        except (ChipStackError, MatterError, InteractionModelError) as err:
             error_code = getattr(err, "error_code", MatterError.error_code)
             message_str = msg.command
             if msg.args and (node_id := msg.args.get("node_id")):

@@ -24,6 +24,7 @@ from chip.clusters.Attribute import AttributeWriteResult, ValueDecodeFailure
 from chip.clusters.ClusterObjects import ALL_ATTRIBUTES, ALL_CLUSTERS, Cluster
 from chip.discovery import DiscoveryType
 from chip.exceptions import ChipStackError
+from chip.interaction_model import InteractionModelError
 from chip.native import PyChipError
 from chip.setup_payload import setup_payload
 from chip.tlv import TLVReader, TLVWriter, uint as tlv_uint
@@ -1102,9 +1103,10 @@ class MatterDeviceController:
                     node_id, group.keyset_id, group.epoch_key_hex
                 )
                 await self.group_bind_key_set(node_id, group_id, group.keyset_id)
-            except ChipStackError as err:
+            except (ChipStackError, InteractionModelError) as err:
                 LOGGER.warning(
-                    "Failed to provision node with group keys, groupcast may not work: %s",
+                    "Failed to provision node %s with group keys, groupcast may not work: %s",
+                    node_id,
                     err,
                 )
 
@@ -1485,6 +1487,7 @@ class MatterDeviceController:
                     epochStartTime0=0,
                 )
             ),
+            timed_request_timeout_ms=1000,
         )
 
     @api_command(APICommand.GROUP_BIND_KEY_SET)
