@@ -243,10 +243,16 @@ class MatterServer:
         # before the CHIP controller is created (it crashes on malformed TLVs).
         # Must operate on the live in-memory storage object (not the file on disk)
         # because PersistentStorage already loaded chip.json into memory at __init__.
-        _cleanup_corrupted_group_storage(
-            self.stack._chip_stack.GetStorageManager(),  # pylint: disable=protected-access
-            self.logger,
-        )
+        try:
+            _cleanup_corrupted_group_storage(
+                self.stack._chip_stack.GetStorageManager(),  # pylint: disable=protected-access
+                self.logger,
+            )
+        except Exception:  # pylint: disable=broad-except  # noqa: BLE001
+            self.logger.warning(
+                "Failed to clean up corrupted group storage; continuing startup anyway.",
+                exc_info=True,
+            )
 
         # Initialize our (intermediate) device controller which keeps track
         # of Matter devices and their subscriptions.
