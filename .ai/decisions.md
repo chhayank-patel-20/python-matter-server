@@ -56,3 +56,29 @@
 ### 4. Production-Ready Group Keys (Transparent Key Generation)
 - **Decision**: Implemented an automated group key generation and injection system in `MatterDeviceController`. When a new group is added, the server generates a 16-byte random `epoch_key` and unique `keyset_id`, stores them, and uses TLV encoding to inject these directly into the underlying `chip.storage.PersistentStorage` used by the controller's C++ `GroupDataProviderImpl`.
 - **Rationale**: The Python Matter SDK wrapper doesn't expose native C++ methods to configure the controller's group keys locally, forcing users to rely on the hardcoded `InitGroupTestingData`. By writing directly to the underlying KVS (which `GroupDataProviderImpl` reads on every `GetGroupKey` call), we bypass this limitation. When `group_add` is called, the server now automatically pushes the generated `KeySetWrite` and `GroupKeyMap` to the node. This provides a transparent, "production-ready" Group Communication experience without manual key management.
+
+### 5. Preservation of Identity Protection Key (IPK)
+- **Decision**: Refined the TLV injection logic to use `0xFFFF` (`kInvalidKeysetId`) as the linked-list terminator and ensured that existing keysets (specifically the IPK with ID `0`) are preserved.
+- **Rationale**: The IPK is essential for establishing secure CASE sessions between nodes. If the linked-list of keysets is corrupted or uses an incorrect terminator (like `0`), the SDK fails to find the IPK, resulting in `CHIP Error 0x000000D8: The item referenced in the function call was not found` and preventing all communication with commissioned nodes.
+
+## 2026-03-24: Fix Group Key Derivation (Critical Bug Fix)
+
+### Root Cause
+`GroupDataProviderImpl` (C++) stores **derived** `GroupOperationalCredentials` in KVS, not raw epoch keys. The derivation is:
+```
+EncryptionKey = HKDF-SHA256(InputKey=epoch_key, Salt=CompressedFabricId, Info="GroupKey v1.0")
+SessionId     = first 2 bytes of HKDF-SHA256(InputKey=EncryptionKey, Salt=zeros32, Info="GroupKeyHash")
+```
+The previous TLV injection stored the raw epoch key as `TagKeyValue` (tag 6) and a hardcoded `0` as `TagKeyHash` (tag 5). This caused every `SendGroupCommand` to encrypt with the wrong key → nodes could never decrypt group messages.
+
+### Bug 1: Wrong key stored in KVS (critical)
+- **Decision**: Added `_derive_group_encryption_key` and `_derive_group_session_id` static methods implementing the HKDF derivations from the Matter spec. The keyset TLV now stores the derived encryption key and correct session ID.
+- **Rationale**: The C++ `SetKeySet` runs this derivation before writing to KVS. Our Python injection must mirror it exactly or the keys will never match.
+
+### Bug 2: TLV keyset array had only 1 item instead of 3 (critical)
+- **Decision**: The keyset `tag3` array now always has exactly 3 items (`kEpochKeysMax`), with slots 1 and 2 zero-filled.
+- **Rationale**: `KeySetData::Deserialize` always reads exactly 3 items from the array via `for (auto & key : operational_keys)`. Writing only 1 item caused a TLV parse failure, so the keyset could never be loaded at all.
+
+### Bug 3: Missing startup migration for existing groups
+- **Decision**: Added `_overwrite_controller_keyset` method. Called in `start()` for every stored group before `_ensure_controller_group_keys`. It re-derives and overwrites the keyset KVS entry while preserving the linked-list `next` pointer.
+- **Rationale**: Existing groups stored with the old buggy code need their keyset KVS entry updated. The `_ensure_controller_group_keys` early-return guard prevented this fix from taking effect for already-stored groups.

@@ -27,6 +27,8 @@ from chip.exceptions import ChipStackError
 from chip.native import PyChipError
 from chip.setup_payload import setup_payload
 from chip.tlv import TLVReader, TLVWriter
+from cryptography.hazmat.primitives.hashes import SHA256
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from zeroconf import (
     BadTypeInNameException,
     DNSQuestionType,
@@ -201,6 +203,10 @@ class MatterDeviceController:
             group_id = int(group_id_str)
             group_info = MatterGroupInfo(**group_dict)
             self._groups[group_id] = group_info
+            # Re-derive and overwrite the keyset KVS entry on every startup.
+            # This is a migration that fixes groups created before the key-derivation
+            # bug was fixed (raw epoch key was stored instead of HKDF-derived key).
+            self._overwrite_controller_keyset(group_info)
             self._ensure_controller_group_keys(group_info)
         LOGGER.info("Loaded %s groups from stored configuration", len(self._groups))
 
@@ -1128,15 +1134,117 @@ class MatterDeviceController:
         """Return all groups in the server registry."""
         return list(self._groups.values())
 
+    @staticmethod
+    def _derive_group_encryption_key(
+        epoch_key: bytes, compressed_fabric_id: int
+    ) -> bytes:
+        """Derive the group operational encryption key from an epoch key.
+
+        Per Matter spec section 4.7.2.1:
+          GCK = HKDF-SHA256(InputKey=epoch_key, Salt=CompressedFabricId, Info="GroupKey v1.0")
+        """
+        fabric_id_bytes = compressed_fabric_id.to_bytes(8, "big")
+        return HKDF(
+            algorithm=SHA256(),
+            length=16,
+            salt=fabric_id_bytes,
+            info=b"GroupKey v1.0",
+        ).derive(epoch_key)
+
+    @staticmethod
+    def _derive_group_session_id(encryption_key: bytes) -> int:
+        """Derive the group session ID (key hash) from the encryption key.
+
+        Per Matter spec:
+          GKH = HKDF-SHA256(InputKey=encryption_key, Salt=zeros32, Info="GroupKeyHash", Length=2)
+        """
+        hash_bytes = HKDF(
+            algorithm=SHA256(),
+            length=2,
+            salt=None,  # None → 32 zero bytes per RFC 5869 (matches C++ empty-salt behaviour)
+            info=b"GroupKeyHash",
+        ).derive(encryption_key)
+        return int.from_bytes(hash_bytes, "big")
+
+    def _overwrite_controller_keyset(self, group: MatterGroupInfo) -> None:
+        """Overwrite the keyset KVS entry with correctly-derived keys.
+
+        Called at startup for every stored group to migrate groups that were created
+        before the key-derivation bug was fixed (old code stored the raw epoch key).
+        Only updates the keyset; leaves the group-info, map, and fabric-data intact.
+        """
+        # pylint: disable=protected-access,broad-exception-caught
+        if group.keyset_id is None or group.epoch_key_hex is None:
+            return
+        try:
+            storage = self.server.stack._chip_stack._persistentStorage
+            fabric_idx = (
+                self._chip_device_controller._chip_controller.GetFabricIndexInternal()
+            )
+            keyset_key_name = f"f/{fabric_idx:x}/k/{group.keyset_id:x}"
+            existing_raw = storage.GetSdkKey(keyset_key_name)
+            if existing_raw is None:
+                return  # doesn't exist yet; _ensure_controller_group_keys will create it
+
+            # Preserve the linked-list `next` pointer from the existing entry.
+            existing = TLVReader(existing_raw).get()["Any"]
+            old_next = existing.get(7, 0xFFFF)
+
+            epoch_key = bytes.fromhex(group.epoch_key_hex)
+            compressed_fabric_id = self._compressed_fabric_id or 0
+            encryption_key = self._derive_group_encryption_key(
+                epoch_key, compressed_fabric_id
+            )
+            session_id = self._derive_group_session_id(encryption_key)
+            zeroed_key = bytes(16)
+
+            writer = TLVWriter()
+            writer.put(
+                None,
+                {
+                    1: 1,  # policy: kCacheAndSync
+                    2: 1,  # keys_count
+                    3: [
+                        {4: 0, 5: session_id, 6: encryption_key},
+                        {4: 0, 5: 0, 6: zeroed_key},
+                        {4: 0, 5: 0, 6: zeroed_key},
+                    ],
+                    7: old_next,
+                },
+            )
+            storage.SetSdkKey(keyset_key_name, writer.encoding)
+            LOGGER.debug(
+                "Refreshed keyset for group %s with correctly-derived key",
+                group.group_id,
+            )
+        except Exception as err:  # noqa: BLE001
+            LOGGER.error(
+                "Failed to refresh controller keyset for group %s: %s",
+                group.group_id,
+                err,
+            )
+
     def _ensure_controller_group_keys(self, group: MatterGroupInfo) -> None:
-        """Inject group mappings into the controller's internal KVS for production use."""
-        # pylint: disable=too-many-locals,protected-access,broad-exception-caught
+        """Inject group mappings into the controller's internal KVS for production use.
+
+        GroupDataProviderImpl reads all group/keyset data directly from persistent storage
+        on every operation (no in-memory cache), so writing the correct TLV here is
+        sufficient to make SendGroupCommand work without restarting the controller.
+
+        Critical: the SDK stores the *derived* GroupOperationalCredentials, NOT the raw
+        epoch key.  Writing the raw key was the original bug that caused all group
+        commands to fail (keys never matched).
+        """
+        # pylint: disable=too-many-locals,too-many-statements,protected-access,broad-exception-caught
         try:
             # Use the PersistentStorage object defined in chip.storage
             storage = self.server.stack._chip_stack._persistentStorage
             fabric_idx = (
                 self._chip_device_controller._chip_controller.GetFabricIndexInternal()
             )
+
+            # 0xFFFF = kInvalidKeysetId (keyset ID 0 is reserved for the IPK)
+            invalid_id = 0xFFFF
 
             group_key_name = f"f/{fabric_idx:x}/g/{group.group_id:x}"
             if storage.GetSdkKey(group_key_name) is not None:
@@ -1145,21 +1253,39 @@ class MatterDeviceController:
 
             # Generate new keyset_id and epoch_key if not present
             if group.keyset_id is None:
-                # Use group_id as keyset_id for simplicity, bounded to 16-bit uint
-                group.keyset_id = group.group_id % 0xFFFF
-                if group.keyset_id == 0:
-                    group.keyset_id = 1
+                # Use group_id as keyset_id for simplicity, avoiding 0 (IPK)
+                group.keyset_id = (group.group_id % 0xFFFE) + 1
             if group.epoch_key_hex is None:
                 group.epoch_key_hex = secrets.token_bytes(16).hex()
 
             # Save the updated group to our local storage
             self.server.storage.set(DATA_KEY_GROUPS, group, subkey=str(group.group_id))
 
+            # --- Key derivation (matches GroupDataProviderImpl::SetKeySet) ---
+            # The SDK stores derived GroupOperationalCredentials, not the raw epoch key.
+            # Derive encryption_key and session_id before writing to KVS.
+            epoch_key = bytes.fromhex(group.epoch_key_hex)
+            compressed_fabric_id = self._compressed_fabric_id or 0
+            encryption_key = self._derive_group_encryption_key(
+                epoch_key, compressed_fabric_id
+            )
+            session_id = self._derive_group_session_id(encryption_key)
+            zeroed_key = bytes(16)
+
             # 1. Update/Create FabricData
             fabric_data_name = f"f/{fabric_idx:x}/g"
             fabric_data_raw = storage.GetSdkKey(fabric_data_name)
             if fabric_data_raw is None:
-                fabric_data = {}
+                # Initialize with SDK defaults (kInvalidKeysetId/kUndefinedGroupId)
+                fabric_data = {
+                    1: 0,  # first_group (0 = kUndefinedGroupId)
+                    2: 0,  # group_count
+                    3: 0,  # first_map
+                    4: 0,  # map_count
+                    5: invalid_id,  # first_keyset (0xFFFF = kInvalidKeysetId)
+                    6: 0,  # keyset_count
+                    7: 0,  # next fabric index (0 = kUndefinedFabricIndex)
+                }
             else:
                 fabric_data = TLVReader(fabric_data_raw).get()["Any"]
 
@@ -1167,41 +1293,49 @@ class MatterDeviceController:
             old_group_count = fabric_data.get(2, 0)
             old_first_map = fabric_data.get(3, 0)
             old_map_count = fabric_data.get(4, 0)
-            old_first_keyset = fabric_data.get(5, 0)
+            old_first_keyset = fabric_data.get(5, invalid_id)
             old_keyset_count = fabric_data.get(6, 0)
 
-            # 2. Write GroupInfo
+            # 2. Write GroupInfo (tags: 1=name, 2=first_endpoint, 3=endpoint_count, 4=next)
             writer = TLVWriter()
             writer.put(
                 None,
                 {
-                    1: group.group_name[:16],  # Max 16 chars
-                    2: 0,
-                    3: 0,
-                    4: old_first_group,
+                    1: group.group_name[:16],  # name (max 16 chars)
+                    2: 0xFFFF,  # first_endpoint = kInvalidEndpointId
+                    3: 0,  # endpoint_count
+                    4: old_first_group,  # next group_id in linked list
                 },
             )
             storage.SetSdkKey(group_key_name, writer.encoding)
             fabric_data[1] = group.group_id
             fabric_data[2] = old_group_count + 1
 
-            # 3. Write Keyset
+            # 3. Write Keyset (tags: 1=policy, 2=keys_count, 3=array[3], 7=next)
+            # IMPORTANT: array must have EXACTLY 3 items (kEpochKeysMax).
+            # tag6 = DERIVED encryption key; tag5 = DERIVED session ID.
             keyset_key_name = f"f/{fabric_idx:x}/k/{group.keyset_id:x}"
             writer = TLVWriter()
             writer.put(
                 None,
                 {
-                    1: 1,  # Policy: kCacheAndSync
-                    2: 1,  # NumKeys
-                    3: [{4: 0, 5: 0, 6: bytes.fromhex(group.epoch_key_hex)}],
-                    7: old_first_keyset,
+                    1: 1,  # policy: kCacheAndSync
+                    2: 1,  # keys_count (1 active epoch key)
+                    3: [
+                        # slot 0 - our active key
+                        {4: 0, 5: session_id, 6: encryption_key},
+                        # slots 1 & 2 - unused, zeroed (required by kEpochKeysMax=3)
+                        {4: 0, 5: 0, 6: zeroed_key},
+                        {4: 0, 5: 0, 6: zeroed_key},
+                    ],
+                    7: old_first_keyset,  # next keyset in linked list
                 },
             )
             storage.SetSdkKey(keyset_key_name, writer.encoding)
             fabric_data[5] = group.keyset_id
             fabric_data[6] = old_keyset_count + 1
 
-            # 4. Write Map (generate random 16-bit Map ID to avoid collisions)
+            # 4. Write Map (tags: 1=group_id, 2=keyset_id, 3=next)
             map_id = secrets.randbelow(50000) + 10000
             map_key_name = f"f/{fabric_idx:x}/gk/{map_id:x}"
             writer = TLVWriter()
@@ -1215,7 +1349,11 @@ class MatterDeviceController:
             writer.put(None, fabric_data)
             storage.SetSdkKey(fabric_data_name, writer.encoding)
 
-            LOGGER.info("Generated controller keys for group %s", group.group_id)
+            LOGGER.info(
+                "Generated controller keys for group %s (keyset_id=%s)",
+                group.group_id,
+                group.keyset_id,
+            )
         except Exception as err:  # noqa: BLE001
             LOGGER.error("Failed to inject controller group keys: %s", err)
 
