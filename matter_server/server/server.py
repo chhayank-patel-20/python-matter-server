@@ -6,9 +6,11 @@ import asyncio
 from functools import cached_property, partial
 import inspect
 import ipaddress
+import json
 import logging
 import os
 from pathlib import Path
+import re
 import traceback
 from typing import TYPE_CHECKING, Any, cast
 import weakref
@@ -70,6 +72,49 @@ def _global_loop_exception_handler(_: Any, context: dict[str, Any]) -> None:
         context["message"],
         **kwargs,  # type: ignore[arg-type]
     )
+
+
+def _cleanup_corrupted_keysets(storage_path: str, logger: logging.Logger) -> None:
+    """Remove malformed group keyset entries from chip.json before controller init.
+
+    The GroupDataProviderImpl C++ class reads keyset TLVs at controller
+    initialization time (SetSingleIpkEpochKey traverses the keyset linked list).
+    Any keyset entry that does not contain exactly 3 epoch key slots will cause
+    a CHIP Error 0x00000026 (Wrong TLV type) and prevent the server from
+    starting.  This function removes all non-IPK keyset entries so the C++
+    code sees a clean slate; they are recreated by the startup logic in
+    MatterDeviceController.start().
+    """
+    chip_json_path = Path(storage_path) / "chip.json"
+    if not chip_json_path.exists():
+        return
+    try:
+        with chip_json_path.open() as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as err:
+        logger.warning("Could not read chip.json for keyset cleanup: %s", err)
+        return
+
+    keyset_pattern = re.compile(r"^f/[0-9a-f]+/k/([0-9a-f]+)$")
+    keys_to_delete = [
+        key
+        for key in data
+        if (match := keyset_pattern.match(key)) and int(match.group(1), 16) != 0
+    ]
+    if not keys_to_delete:
+        return
+
+    for key in keys_to_delete:
+        del data[key]
+    try:
+        with chip_json_path.open("w") as fh:
+            json.dump(data, fh)
+        logger.info(
+            "Removed %d stale group keyset entries from storage (will be recreated at startup)",
+            len(keys_to_delete),
+        )
+    except OSError as err:
+        logger.warning("Could not write cleaned chip.json: %s", err)
 
 
 def mount_websocket(server: MatterServer, path: str) -> None:
@@ -178,6 +223,10 @@ class MatterServer:
             fetch_test_certificates=self.enable_test_net_dcl,
             fetch_production_certificates=True,
         )
+
+        # Remove any malformed group keyset entries left by earlier buggy code
+        # before the CHIP controller is created (it crashes on malformed TLVs).
+        _cleanup_corrupted_keysets(self.storage_path, self.logger)
 
         # Initialize our (intermediate) device controller which keeps track
         # of Matter devices and their subscriptions.
