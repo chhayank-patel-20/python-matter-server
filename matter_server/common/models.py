@@ -142,6 +142,8 @@ class MatterGroupInfo:
 
     group_id: int
     group_name: str
+    keyset_id: int | None = None
+    epoch_key_hex: str | None = None
 
 
 @dataclass

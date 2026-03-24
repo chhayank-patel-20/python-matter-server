@@ -52,3 +52,7 @@
 ### 3. Documented Group ID Limitations in Test Mode
 - **Decision**: Added documentation explaining that `init_group_testing_data` typically only supports Group IDs `257` (0x0101) and `258` (0x0102) for the controller.
 - **Rationale**: The SDK's built-in test data is hardcoded to specific Group IDs. Users using IDs like `1` or `2` will receive `0xAC` because the controller lacks keys for those IDs. Explicit documentation and an improved error message guide the user to working IDs.
+
+### 4. Production-Ready Group Keys (Transparent Key Generation)
+- **Decision**: Implemented an automated group key generation and injection system in `MatterDeviceController`. When a new group is added, the server generates a 16-byte random `epoch_key` and unique `keyset_id`, stores them, and uses TLV encoding to inject these directly into the underlying `chip.storage.PersistentStorage` used by the controller's C++ `GroupDataProviderImpl`.
+- **Rationale**: The Python Matter SDK wrapper doesn't expose native C++ methods to configure the controller's group keys locally, forcing users to rely on the hardcoded `InitGroupTestingData`. By writing directly to the underlying KVS (which `GroupDataProviderImpl` reads on every `GetGroupKey` call), we bypass this limitation. When `group_add` is called, the server now automatically pushes the generated `KeySetWrite` and `GroupKeyMap` to the node. This provides a transparent, "production-ready" Group Communication experience without manual key management.
