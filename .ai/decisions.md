@@ -94,3 +94,9 @@ The previous TLV injection stored the raw epoch key as `TagKeyValue` (tag 6) and
 ### Bug 5: Startup cleanup missed FabricData, GroupData, and KeyMapData
 - **Decision**: Renamed to `_cleanup_corrupted_group_storage()` and extended to also delete `f/X/g` (FabricData), `f/X/g/Y` (GroupInfo), and `f/X/gk/Y` (KeyMapData) in addition to non-IPK keysets. All are recreated with correct `tlv_uint` values by `MatterDeviceController.start()`.
 - **Rationale**: After fixing the keyset-only cleanup, the crash persisted because FabricData/GroupInfo/KeyMapData entries remained with signed-int TLV. Deleting all group storage entries forces clean recreation on startup. Key note: `chip.json` has structure `{"sdk-config": {...}, "repl-config": {...}}` — SDK entries live under `sdk-config`, not at the top level.
+
+## 2026-03-24: Fix BLE Commissioning Network Information Error
+
+### 1. Use specialized CommissionWiFi and CommissionThread methods
+- **Decision**: Updated `commission_ble` in `sdk.py` to use `self._chip_controller.CommissionWiFi` and `self._chip_controller.CommissionThread` when WiFi credentials or a Thread dataset are provided, instead of the generic `ConnectBLE`.
+- **Rationale**: The SDK's `ConnectBLE` establishes a session but may fail to pass pre-set network credentials to the internal `AutoCommissioner`, resulting in `CHIP Error 0x0000002F: Invalid argument` and the log message "Required network information not provided in commissioning parameters". By using the specialized methods and passing credentials directly as arguments, we ensure the `AutoCommissioner` has the necessary information to complete the commissioning process for WiFi and Thread devices.

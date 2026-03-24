@@ -157,6 +157,36 @@ class ChipDeviceControllerWrapper:
         thread_dataset: str | None = None,
     ) -> int:
         """Commission a device over BLE."""
+        if wifi_credentials and not thread_dataset:
+            # If only WiFi credentials are provided, use CommissionWiFi as it properly
+            # passes the network parameters to the AutoCommissioner.
+            return cast(
+                int,
+                await self._chip_controller.CommissionWiFi(
+                    discriminator=discriminator,
+                    setupPinCode=setup_pin_code,
+                    nodeId=node_id,
+                    ssid=wifi_credentials[0],
+                    credentials=wifi_credentials[1],
+                    isShortDiscriminator=is_short_discriminator,
+                ),
+            )
+
+        if thread_dataset and not wifi_credentials:
+            # If only Thread dataset is provided, use CommissionThread as it properly
+            # passes the network parameters to the AutoCommissioner.
+            return cast(
+                int,
+                await self._chip_controller.CommissionThread(
+                    discriminator=discriminator,
+                    setupPinCode=setup_pin_code,
+                    nodeId=node_id,
+                    threadOperationalDataset=bytes.fromhex(thread_dataset),
+                    isShortDiscriminator=is_short_discriminator,
+                ),
+            )
+
+        # Fallback to current behavior if both or none are provided
         if wifi_credentials:
             await self.set_wifi_credentials(*wifi_credentials)
         if thread_dataset:

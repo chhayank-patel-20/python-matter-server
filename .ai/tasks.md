@@ -15,6 +15,7 @@
 - [x] Fix ruff TC002 lint error: move `chip.storage.PersistentStorage` import into `TYPE_CHECKING` block in `server.py`.
 - [x] Add startup fallback: wrap `_cleanup_corrupted_group_storage()` in try/except so unexpected errors log a warning instead of crashing the server.
 - [x] Fix `group_send_command` 0xAC ordering bug: `init_group_testing_data()` was overwriting FabricData after custom key injection, orphaning group 1 entries. Fixed by calling `init_group_testing_data()` first in `start()`.
+- [x] Fix "Required network information not provided" error during BLE commissioning: updated `commission_ble` in `sdk.py` to use specialized `CommissionWiFi` and `CommissionThread` methods instead of `ConnectBLE` when network credentials are provided.
 
 ## Backlog
 - [ ] Add `discover` command to `scripts/cli_client.py`.

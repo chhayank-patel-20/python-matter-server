@@ -160,6 +160,8 @@ Update the fabric label of an already commissioned node.
 
 Commission a new device using a pairing code. For WiFi or Thread based devices, the credentials need to be set upfront, otherwise, commissioning will fail. Supports both QR-code syntax (MT:...) and manual pairing code as string.
 
+Note: The server includes an optimized BLE commissioning path that extracts the discriminator from the setup code to improve discovery reliability. When credentials are provided, it uses specialized SDK methods to ensure network parameters are correctly passed to the device.
+
 ```json
 {
   "message_id": "2",
