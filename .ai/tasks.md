@@ -11,7 +11,7 @@
 - [x] Implement automatic retry for `0xAC` in `group_send_command`.
 - [x] Add node-side group key management APIs (`group_add_key_set`, `group_bind_key_set`).
 - [x] Fix critical group key derivation bug: TLV injection was storing raw epoch key instead of HKDF-derived encryption key + wrong array size (kEpochKeysMax=3) + wrong hash. Added `_derive_group_encryption_key`, `_derive_group_session_id`, and `_overwrite_controller_keyset` (startup migration).
-- [x] Fix Raspberry Pi startup crash (CHIP Error 0x00000026: Wrong TLV type): corrupted keyset entries in chip.json from old buggy code crashed GroupDataProviderImpl on controller init. Added `_cleanup_corrupted_keysets()` in `server.py` to scrub non-IPK keyset entries before `MatterDeviceController` is created.
+- [x] Fix Raspberry Pi startup crash (CHIP Error 0x00000026: Wrong TLV type): root cause was Python TLVWriter writing signed integers for all int values, but C++ expects unsigned. Fixed by using `tlv_uint()` everywhere in TLV writes. Widened cleanup to delete all group-related KVS entries (FabricData, GroupInfo, KeyMapData, keysets) before NewController() runs.
 
 ## Backlog
 - [ ] Add `discover` command to `scripts/cli_client.py`.
