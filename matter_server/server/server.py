@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from functools import cached_property, partial
 import inspect
 import ipaddress
-import json
 import logging
 import os
 from pathlib import Path
@@ -46,6 +46,8 @@ from .vendor_info import VendorInfo
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from chip.storage import PersistentStorage
+
 DASHBOARD_DIR = Path(__file__).parent.joinpath("../dashboard/").resolve()
 DASHBOARD_DIR_EXISTS = DASHBOARD_DIR.exists()
 
@@ -74,69 +76,60 @@ def _global_loop_exception_handler(_: Any, context: dict[str, Any]) -> None:
     )
 
 
-def _cleanup_corrupted_group_storage(storage_path: str, logger: logging.Logger) -> None:
-    """Remove all Python-written group TLV entries from chip.json before controller init.
+def _cleanup_corrupted_group_storage(
+    storage: PersistentStorage, logger: logging.Logger
+) -> None:
+    """Remove all Python-written group TLV entries from the live in-memory storage.
 
-    All group-related KVS entries that were written by our Python code used plain
-    Python int (signed TLV integers) instead of chip.tlv.uint (unsigned TLV integers).
-    C++ TLVReader::Get(uint16_t/uint8_t) rejects signed TLV elements with
+    PersistentStorage loads chip.json into an in-memory dict at __init__ time.
+    The C++ GroupDataProviderImpl reads/writes that dict on EVERY operation.
+    Modifying the file on disk has NO EFFECT on the running process; we must
+    call DeleteSdkKey() on the live storage object to update the in-memory dict.
+
+    All group-related KVS entries written by our Python code used plain Python
+    int (signed TLV integers) instead of chip.tlv.uint (unsigned TLV integers).
+    C++ TLVReader::Get(uint64_t/uint16_t) rejects signed TLV elements with
     CHIP Error 0x00000026 (Wrong TLV type), crashing NewController() on startup.
 
-    Affected key patterns (under chip.json "sdk-config"):
-      f/<fabric>/k/<id>   keyset entries  (id != 0 to preserve IPK)
+    Affected key patterns (under "sdk-config"):
+      f/<fabric>/k/<id>   keyset entries  (id != 0 to preserve the IPK at id=0)
       f/<fabric>/g        FabricData header
       f/<fabric>/g/<id>   per-group GroupInfo
       f/<fabric>/gk/<id>  KeyMapData
 
-    All of these are recreated correctly (with tlv_uint values) by
+    These are all recreated correctly (with tlv_uint values) by
     MatterDeviceController.start() via _ensure_controller_group_keys().
     """
-    chip_json_path = Path(storage_path) / "chip.json"
-    if not chip_json_path.exists():
-        return
-    try:
-        with chip_json_path.open() as fh:
-            data = json.load(fh)
-    except (OSError, ValueError) as err:
-        logger.warning("Could not read chip.json for group storage cleanup: %s", err)
-        return
+    # storage.jsonData returns a deep copy; use it only for key enumeration.
+    sdk_config = storage.jsonData.get("sdk-config", {})
 
-    # chip.json stores SDK keys under the nested "sdk-config" key.
-    sdk_config = data.get("sdk-config", {})
-    if not isinstance(sdk_config, dict):
-        return
-
-    # Match all group-related entries we may have written.
-    # Preserve the IPK keyset (f/<fabric>/k/0) and all non-group fabric entries.
     non_ipk_keyset = re.compile(r"^f/[0-9a-f]+/k/([0-9a-f]+)$")
-    fabric_data = re.compile(r"^f/[0-9a-f]+/g$")
-    group_data = re.compile(r"^f/[0-9a-f]+/g/[0-9a-f]+$")
-    key_map_data = re.compile(r"^f/[0-9a-f]+/gk/[0-9a-f]+$")
+    fabric_data_pat = re.compile(r"^f/[0-9a-f]+/g$")
+    group_data_pat = re.compile(r"^f/[0-9a-f]+/g/[0-9a-f]+$")
+    key_map_data_pat = re.compile(r"^f/[0-9a-f]+/gk/[0-9a-f]+$")
 
     keys_to_delete = [
         key
         for key in sdk_config
         if (
             ((m := non_ipk_keyset.match(key)) and int(m.group(1), 16) != 0)
-            or fabric_data.match(key)
-            or group_data.match(key)
-            or key_map_data.match(key)
+            or fabric_data_pat.match(key)
+            or group_data_pat.match(key)
+            or key_map_data_pat.match(key)
         )
     ]
     if not keys_to_delete:
         return
 
+    # DeleteSdkKey updates the in-memory dict AND commits to chip.json.
     for key in keys_to_delete:
-        del sdk_config[key]
-    try:
-        with chip_json_path.open("w") as fh:
-            json.dump(data, fh, ensure_ascii=True, indent=4)
-        logger.info(
-            "Removed %d stale group storage entries from chip.json (will be recreated at startup)",
-            len(keys_to_delete),
-        )
-    except OSError as err:
-        logger.warning("Could not write cleaned chip.json: %s", err)
+        with contextlib.suppress(KeyError):
+            storage.DeleteSdkKey(key)
+
+    logger.info(
+        "Removed %d stale group storage entries from SDK storage (will be recreated at startup)",
+        len(keys_to_delete),
+    )
 
 
 def mount_websocket(server: MatterServer, path: str) -> None:
@@ -248,7 +241,12 @@ class MatterServer:
 
         # Remove any malformed group storage entries left by earlier buggy code
         # before the CHIP controller is created (it crashes on malformed TLVs).
-        _cleanup_corrupted_group_storage(self.storage_path, self.logger)
+        # Must operate on the live in-memory storage object (not the file on disk)
+        # because PersistentStorage already loaded chip.json into memory at __init__.
+        _cleanup_corrupted_group_storage(
+            self.stack._chip_stack.GetStorageManager(),  # pylint: disable=protected-access
+            self.logger,
+        )
 
         # Initialize our (intermediate) device controller which keeps track
         # of Matter devices and their subscriptions.
