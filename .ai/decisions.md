@@ -100,3 +100,44 @@ The previous TLV injection stored the raw epoch key as `TagKeyValue` (tag 6) and
 ### 1. Use specialized CommissionWiFi and CommissionThread methods
 - **Decision**: Updated `commission_ble` in `sdk.py` to use `self._chip_controller.CommissionWiFi` and `self._chip_controller.CommissionThread` when WiFi credentials or a Thread dataset are provided, instead of the generic `ConnectBLE`.
 - **Rationale**: The SDK's `ConnectBLE` establishes a session but may fail to pass pre-set network credentials to the internal `AutoCommissioner`, resulting in `CHIP Error 0x0000002F: Invalid argument` and the log message "Required network information not provided in commissioning parameters". By using the specialized methods and passing credentials directly as arguments, we ensure the `AutoCommissioner` has the necessary information to complete the commissioning process for WiFi and Thread devices.
+
+## 2026-03-25: BLE Scanner and MAC-based Commissioning APIs
+
+### 1. Add `scan_ble_devices` API command (using bleak)
+- **Decision**: Added `scan_ble_devices(mac_address, timeout)` API command in `device_controller.py` using the `bleak` library. Added `BLEScanResult` dataclass to `models.py` and `bleak>=0.21.0` to `pyproject.toml` server extras.
+- **Rationale**: The existing `discover_commissionable_nodes` only returns CHIP-SDK parsed Matter nodes (filtered). Users need a lower-level raw BLE scan to: (a) find a device by MAC, (b) inspect advertisement data to diagnose commissioning readiness, (c) confirm whether `fff6` Matter service UUID is present before attempting commissioning.
+
+### 2. Add `commission_with_mac` API command
+- **Decision**: Added `commission_with_mac(mac_address, setup_pin_code, scan_timeout)` which scans for a device by MAC, extracts the discriminator from the `fff6` service data, and calls the existing `commission_ble` flow.
+- **Rationale**: Users should not need the QR code to commission — the MAC address (visible on a label) + PIN code is sufficient when the device is in commissioning mode. The CHIP SDK does not support MAC-based BLE connection (requires discriminator), so we extract it automatically from the BLE advertisement. If the device is NOT in commissioning mode (no `fff6` UUID), a clear error is returned explaining the user must open a commissioning window first.
+
+### 3. Why fff6 UUID is absent sometimes (documented)
+- The Matter BLE commissioning window is only open for a limited time after a button press or factory reset. Without `fff6`, the CHIP SDK cannot commission the device — the discriminator, vendor ID, and product ID encoded in the 8-byte `fff6` service data are required. This is now explained in `docs/websockets_api.md`.
+
+## 2026-03-25: Multi-Fabric Commissioning Support
+
+### 1. Add `commission_on_commissioning_window` API command
+- **Decision**: Added a dedicated `commission_on_commissioning_window(setup_pin_code, discriminator, ip_addr, fabric_label)` API command as the explicit Multi-Fabric Commissioning path.
+- **Rationale**: While `commission_on_network` with `FilterType.LONG_DISCRIMINATOR` could technically do this, it is not obvious. A dedicated, clearly-named command makes the multi-fabric use case self-documenting. Internally it calls the same `commission_on_network` SDK path with the long-discriminator filter.
+
+### 2. Add `fabric_label` parameter to all commissioning commands
+- **Decision**: Added optional `fabric_label: str | None` parameter to `commission_with_code`, `commission_on_network`, `commission_with_mac`, and `commission_on_commissioning_window`. When provided, calls `update_fabric_label` after successful commissioning.
+- **Rationale**: In multi-fabric setups, devices appear in multiple controllers' fabric tables. A fabric label (up to 32 chars) identifies which controller owns which fabric entry, visible via `get_fabrics(node_id)`. Errors in setting the label are logged as warnings and do not fail commissioning.
+
+### 3. Multi-Fabric flow is now fully documented
+- **Decision**: Updated `docs/websockets_api.md` with the full two-step multi-fabric flow, updated `open_commissioning_window` docs to explain its role (Step 1), and added `commission_on_commissioning_window` docs (Step 2).
+- **Rationale**: The `open_commissioning_window` already existed but was not documented as part of a multi-fabric flow. Combined with the new command, users now have a complete, documented path.
+
+## 2026-03-25: Fix group_add Failures (Timed Interaction)
+
+### 1. Add timed interaction to `AddGroup` command
+- **Decision**: Added `timed_request_timeout_ms=5000` to the `send_command` call for `AddGroup` in `group_add` (`device_controller.py`).
+- **Rationale**: Matter spec §11.2.6.1 requires a timed interaction for `AddGroup`. Without it, real devices reject the command with `UNSUPPORTED_ACCESS` (0x7e).
+
+### 2. Add timed-write support to `write_attribute` in `sdk.py`
+- **Decision**: Added `timed_request_timeout_ms: int | None = None` parameter to `write_attribute` in `sdk.py`, passed through as `timedWriteTimeoutMs` to `chip_controller.WriteAttribute`. Updated `group_bind_key_set` to pass `timed_request_timeout_ms=5000`.
+- **Rationale**: `GroupKeyMap` is a fabric-scoped security attribute that requires timed interaction per Matter spec §11.2.7.1. The `write_attribute` wrapper previously had no way to enable timed writes.
+
+### 3. Increase `group_add_key_set` timed timeout from 1000ms to 5000ms
+- **Decision**: Changed `timed_request_timeout_ms` from `1000` to `5000` in `group_add_key_set`.
+- **Rationale**: 1 second was too tight for `KeySetWrite` over a wireless path, causing silent failures (exceptions caught as warnings in `group_add`) before the key was actually provisioned.

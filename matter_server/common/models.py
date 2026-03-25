@@ -70,6 +70,9 @@ class APICommand(StrEnum):
     GROUP_ADD_KEY_SET = "group_add_key_set"
     GROUP_BIND_KEY_SET = "group_bind_key_set"
     INIT_GROUP_TESTING_DATA = "init_group_testing_data"
+    SCAN_BLE_DEVICES = "scan_ble_devices"
+    COMMISSION_WITH_MAC = "commission_with_mac"
+    COMMISSION_ON_COMMISSIONING_WINDOW = "commission_on_commissioning_window"
 
 
 EventCallBackType = Callable[[EventType, Any], None]
@@ -255,6 +258,22 @@ class CommissioningParameters:
     setup_pin_code: int
     setup_manual_code: str
     setup_qr_code: str
+
+
+@dataclass
+class BLEScanResult:
+    """Object returned by the 'scan_ble_devices' command."""
+
+    address: str
+    name: str | None
+    rssi: int | None
+    service_uuids: list[str]
+    service_data: dict[str, str]  # UUID → space-separated hex bytes
+    manufacturer_data: dict[int, str]  # Company ID → space-separated hex bytes
+    is_matter: bool  # True if fff6 Matter service UUID present with data
+    matter_discriminator: int | None  # Decoded from fff6 service data
+    matter_vendor_id: int | None  # Decoded from fff6 service data
+    matter_product_id: int | None  # Decoded from fff6 service data
 
 
 class UpdateSource(Enum):

@@ -16,6 +16,10 @@
 - [x] Add startup fallback: wrap `_cleanup_corrupted_group_storage()` in try/except so unexpected errors log a warning instead of crashing the server.
 - [x] Fix `group_send_command` 0xAC ordering bug: `init_group_testing_data()` was overwriting FabricData after custom key injection, orphaning group 1 entries. Fixed by calling `init_group_testing_data()` first in `start()`.
 - [x] Fix "Required network information not provided" error during BLE commissioning: updated `commission_ble` in `sdk.py` to use specialized `CommissionWiFi` and `CommissionThread` methods instead of `ConnectBLE` when network credentials are provided.
+- [x] Add `scan_ble_devices` API command: raw BLE scan using `bleak`, filters by MAC address, returns `BLEScanResult` with service UUIDs/data, is_matter flag, and decoded Matter discriminator/vendor/product IDs.
+- [x] Add `commission_with_mac` API command: scans for device by MAC, auto-extracts discriminator from fff6 advertisement, commissions via existing `commission_ble` flow. No QR code needed.
+- [x] Add Multi-Fabric Commissioning support: new `commission_on_commissioning_window` command + `fabric_label` parameter on all commissioning commands.
+- [x] Fix `group_add` failures: added `timed_request_timeout_ms=5000` to `AddGroup` send_command, added timed-write support to `write_attribute` in `sdk.py` + `group_bind_key_set`, increased `group_add_key_set` timeout from 1000ms to 5000ms.
 
 ## Backlog
 - [ ] Add `discover` command to `scripts/cli_client.py`.

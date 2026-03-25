@@ -61,6 +61,117 @@ Get a map of vendor ids to vendor names.
 
 ### Commissioning
 
+**Scan BLE Devices**
+
+Scan for nearby BLE devices and return raw advertisement data. Optionally filter by MAC address.
+Use `timeout` of 20-30 seconds for reliable discovery (devices advertise periodically).
+
+> **Why does my device show different data each time?**
+> A Matter device only includes the Matter service UUID `0000fff6-0000-1000-8000-00805f9b34fb`
+> in its advertisement when a **commissioning window is open** (triggered by a button press or
+> factory reset). When `is_matter` is `false`, the device is not ready to be paired — open a
+> commissioning window on the device first. When `is_matter` is `true`, the `matter_discriminator`
+> is extracted automatically and can be used by `commission_with_mac`.
+
+```json
+{
+  "message_id": "1",
+  "command": "scan_ble_devices",
+  "args": {
+    "mac_address": "50:3D:D1:C0:5B:AB",
+    "timeout": 30.0
+  }
+}
+```
+
+Omit `mac_address` to return all nearby BLE devices.
+
+**Example Response (device in commissioning mode):**
+
+```json
+{
+  "message_id": "1",
+  "result": [
+    {
+      "address": "50:3D:D1:C0:5B:AB",
+      "name": "P210M_P3H6ucHr",
+      "rssi": -69,
+      "service_uuids": [
+        "00008641-0000-1000-8000-00805f9b34fb",
+        "0000fff6-0000-1000-8000-00805f9b34fb"
+      ],
+      "service_data": {
+        "0000fff6-0000-1000-8000-00805f9b34fb": "00 00 04 92 13 00 00 BF"
+      },
+      "manufacturer_data": {},
+      "is_matter": true,
+      "matter_discriminator": 0,
+      "matter_vendor_id": 37396,
+      "matter_product_id": 1170
+    }
+  ]
+}
+```
+
+**Example Response (device NOT in commissioning mode):**
+
+```json
+{
+  "message_id": "1",
+  "result": [
+    {
+      "address": "50:3D:D1:C0:5B:AB",
+      "name": "P210M_P3H6ucHr",
+      "rssi": -69,
+      "service_uuids": ["00008641-0000-1000-8000-00805f9b34fb"],
+      "service_data": {},
+      "manufacturer_data": {},
+      "is_matter": false,
+      "matter_discriminator": null,
+      "matter_vendor_id": null,
+      "matter_product_id": null
+    }
+  ]
+}
+```
+
+---
+
+**Commission with MAC Address**
+
+Commission a Matter device using its BLE MAC address and setup PIN code — no QR code needed.
+The server scans for the device, extracts the discriminator from its Matter BLE advertisement,
+and commissions it using any pre-set WiFi/Thread credentials.
+
+**Requirements:**
+- Device must be in commissioning mode (`is_matter: true` in scan results)
+- Set WiFi credentials first via `set_wifi_credentials` (for WiFi devices)
+- Set Thread dataset first via `set_thread_dataset` (for Thread devices)
+
+```json
+{
+  "message_id": "2",
+  "command": "commission_with_mac",
+  "args": {
+    "mac_address": "50:3D:D1:C0:5B:AB",
+    "setup_pin_code": 12345678,
+    "scan_timeout": 30.0
+  }
+}
+```
+
+Returns the commissioned `MatterNodeData` on success. Raises an error if:
+- The device is not found in range
+- The device is not in Matter commissioning mode (no `fff6` UUID)
+- BLE commissioning itself fails
+
+**Typical workflow:**
+1. `scan_ble_devices` → confirm `is_matter: true` (press button if false)
+2. `set_wifi_credentials` → provide network credentials
+3. `commission_with_mac` → device is commissioned and returned as a node
+
+---
+
 **Discover**
 
 Discover Commissionable Nodes (discovered on BLE or mDNS). Returns the current list. New discoveries will be sent as `discovery_updated` events.
@@ -162,12 +273,15 @@ Commission a new device using a pairing code. For WiFi or Thread based devices, 
 
 Note: The server includes an optimized BLE commissioning path that extracts the discriminator from the setup code to improve discovery reliability. When credentials are provided, it uses specialized SDK methods to ensure network parameters are correctly passed to the device.
 
+Optional `fabric_label` sets a label for our fabric on the device (visible in `get_fabrics`). Useful in multi-fabric setups to identify which controller owns which entry.
+
 ```json
 {
   "message_id": "2",
   "command": "commission_with_code",
   "args": {
-    "code": "MT:Y.ABCDEFG123456789"
+    "code": "MT:Y.ABCDEFG123456789",
+    "fabric_label": "MyServer"
   }
 }
 ```
@@ -190,18 +304,72 @@ Commission a device already present on the network.
 
 **Open Commissioning window**
 
-Open a commissioning window to commission a device present on this controller to another.
-Returns code to use as discriminator.
+Open a commissioning window on an already-commissioned device to allow a **second Matter controller** to add it to their fabric (Multi-Fabric Commissioning — Step 1).
+Returns `setup_pin_code`, `setup_manual_code`, and `setup_qr_code` for the second controller to use.
 
 ```json
 {
   "message_id": "2",
   "command": "open_commissioning_window",
   "args": {
-    "node_id": 1
+    "node_id": 1,
+    "timeout": 300,
+    "iteration": 1000
   }
 }
 ```
+
+**Example Response:**
+```json
+{
+  "message_id": "2",
+  "result": {
+    "setup_pin_code": 12345678,
+    "setup_manual_code": "35325335079",
+    "setup_qr_code": "MT:Y.ABCDEFG123456789"
+  }
+}
+```
+
+---
+
+**Commission on Commissioning Window (Multi-Fabric)**
+
+Add a device to our fabric when it already belongs to another fabric (Multi-Fabric Commissioning — Step 2).
+Use the `setup_pin_code` and `discriminator` returned by the other controller's `open_commissioning_window` call.
+
+> **Multi-Fabric flow:**
+> 1. Device is on **Fabric A** (another controller).
+> 2. Fabric A calls `open_commissioning_window(node_id)` → shares `setup_pin_code` + `discriminator` with you.
+> 3. You call `commission_on_commissioning_window` → device is now on **both fabrics**.
+>
+> To share **your** device to another fabric: call `open_commissioning_window` on your node and give the returned codes to the other controller.
+
+```json
+{
+  "message_id": "2",
+  "command": "commission_on_commissioning_window",
+  "args": {
+    "setup_pin_code": 12345678,
+    "discriminator": 3840,
+    "ip_addr": null,
+    "fabric_label": "MyServer"
+  }
+}
+```
+
+| Arg | Required | Description |
+|---|---|---|
+| `setup_pin_code` | Yes | From the other controller's `open_commissioning_window` result |
+| `discriminator` | Yes | From the other controller's `open_commissioning_window` result |
+| `ip_addr` | No | Direct IP to skip mDNS discovery (faster, use when IP is known) |
+| `fabric_label` | No | Label to identify our fabric on the device (visible in `get_fabrics`) |
+
+Returns `MatterNodeData` of the newly commissioned node.
+
+After commissioning, call `get_fabrics(node_id)` to confirm the device is on multiple fabrics.
+
+---
 
 **Get Fabrics**
 

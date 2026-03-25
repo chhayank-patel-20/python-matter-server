@@ -42,6 +42,7 @@ from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZerocon
 from matter_server.common.const import VERBOSE_LOG_LEVEL
 from matter_server.common.custom_clusters import check_polled_attributes
 from matter_server.common.models import (
+    BLEScanResult,
     CommissionableNodeData,
     CommissioningParameters,
     MatterSoftwareVersion,
@@ -91,6 +92,7 @@ if TYPE_CHECKING:
 DATA_KEY_NODES = "nodes"
 DATA_KEY_GROUPS = "groups"
 DATA_KEY_LAST_NODE_ID = "last_node_id"
+_MATTER_BLE_SERVICE_UUID = "0000fff6-0000-1000-8000-00805f9b34fb"
 
 LOGGER = logging.getLogger(__name__)
 NODE_SUBSCRIPTION_FLOOR_DEFAULT = 1
@@ -341,14 +343,17 @@ class MatterDeviceController:
         self._default_fabric_label = label
 
     @api_command(APICommand.COMMISSION_WITH_CODE)
-    async def commission_with_code(
-        self, code: str, network_only: bool = False
+    async def commission_with_code(  # pylint: disable=too-many-branches
+        self, code: str, network_only: bool = False, fabric_label: str | None = None
     ) -> MatterNodeData:
         """
         Commission a device using a QR Code or Manual Pairing Code.
 
         :param code: The QR Code or Manual Pairing Code for device commissioning.
         :param network_only: If True, restricts device discovery to network only.
+        :param fabric_label: Optional label to set on this fabric entry on the device
+                             (visible via get_fabrics). Useful for multi-fabric setups
+                             to identify which controller owns which fabric.
 
         :return: The NodeInfo of the commissioned device.
         """
@@ -438,6 +443,14 @@ class MatterDeviceController:
         # make sure we start a subscription for this newly added node
         if task := self._setup_node_create_task(node_id):
             await task
+        # Set fabric label if requested (allows identifying our fabric on multi-fabric devices)
+        if fabric_label:
+            try:
+                await self.update_fabric_label(node_id, fabric_label)
+            except Exception as err:  # noqa: BLE001  # pylint: disable=W0718
+                LOGGER.warning(
+                    "Failed to set fabric label for node %s: %s", node_id, err
+                )
         LOGGER.info("Commissioning of Node ID %s completed.", node_id)
         # return full node object once we're complete
         return self.get_node(node_id)
@@ -481,6 +494,7 @@ class MatterDeviceController:
         filter_type: int = 0,
         filter: Any = None,  # pylint: disable=redefined-builtin
         ip_addr: str | None = None,
+        fabric_label: str | None = None,
     ) -> MatterNodeData:
         """
         Do the routine for OnNetworkCommissioning, with a filter for mDNS discovery.
@@ -490,6 +504,9 @@ class MatterDeviceController:
 
         NOTE: For advanced usecases only, use `commission_with_code`
         for regular commissioning.
+
+        :param fabric_label: Optional label to identify our fabric on the device
+                             (useful for multi-fabric setups).
 
         Returns full NodeInfo once complete.
         """
@@ -549,8 +566,113 @@ class MatterDeviceController:
         # make sure we start a subscription for this newly added node
         if task := self._setup_node_create_task(node_id):
             await task
+        # Set fabric label if requested (allows identifying our fabric on multi-fabric devices)
+        if fabric_label:
+            try:
+                await self.update_fabric_label(node_id, fabric_label)
+            except Exception as err:  # noqa: BLE001  # pylint: disable=W0718
+                LOGGER.warning(
+                    "Failed to set fabric label for node %s: %s", node_id, err
+                )
         LOGGER.info("Commissioning of Node ID %s completed.", node_id)
         # return full node object once we're complete
+        return self.get_node(node_id)
+
+    @api_command(APICommand.COMMISSION_ON_COMMISSIONING_WINDOW)
+    async def commission_on_commissioning_window(
+        self,
+        setup_pin_code: int,
+        discriminator: int,
+        ip_addr: str | None = None,
+        fabric_label: str | None = None,
+    ) -> MatterNodeData:
+        """Commission a device that has an open commissioning window from another fabric.
+
+        This is the explicit Multi-Fabric Commissioning path. Use this when a device is already
+        commissioned to a different Matter controller/fabric, and that controller has called
+        open_commissioning_window to share the device. Pass the setup_pin_code and discriminator
+        returned by the other controller's open_commissioning_window call.
+
+        The full multi-fabric flow:
+          1. Device is already on Fabric A (another controller).
+          2. Fabric A calls open_commissioning_window(node_id) → returns CommissioningParameters.
+          3. Fabric A shares setup_pin_code and discriminator (or manual/QR code) with you.
+          4. You call this command → device is now on both Fabric A AND your fabric.
+
+        To share YOUR device to another fabric: call open_commissioning_window(node_id) on
+        your side and share the returned CommissioningParameters with the other controller.
+
+        :param setup_pin_code: The setup PIN code from open_commissioning_window result.
+        :param discriminator: The discriminator from open_commissioning_window result.
+        :param ip_addr: Optional direct IP address (skips mDNS discovery, faster).
+        :param fabric_label: Optional label to identify our fabric on the device.
+                             Visible in get_fabrics() result. Max 32 chars.
+        :return: The commissioned MatterNodeData.
+        """
+        from chip.discovery import FilterType  # noqa: PLC0415  # pylint: disable=C0415
+
+        LOGGER.info(
+            "Starting multi-fabric commissioning with discriminator=%s pin=%s",
+            discriminator,
+            setup_pin_code,
+        )
+        node_id = self._get_next_node_id()
+
+        if ip_addr is not None:
+            ip_addr = self.server.scope_ipv6_lla(ip_addr)
+
+        try:
+            if ip_addr is None:
+                commissioned_node_id = (
+                    await self._chip_device_controller.commission_on_network(
+                        node_id,
+                        setup_pin_code,
+                        FilterType.LONG_DISCRIMINATOR,
+                        discriminator,
+                    )
+                )
+            else:
+                commissioned_node_id = await self._chip_device_controller.commission_ip(
+                    node_id, setup_pin_code, ip_addr
+                )
+            if commissioned_node_id != node_id:
+                raise RuntimeError("Returned Node ID must match requested Node ID")
+        except ChipStackError as err:
+            raise NodeCommissionFailed(
+                f"Multi-fabric commissioning failed for node {node_id}."
+            ) from err
+
+        LOGGER.info("Multi-fabric commissioning of Node ID %s successful.", node_id)
+
+        retries = 3
+        while retries:
+            try:
+                await self._interview_node(node_id)
+            except NodeInterviewFailed as err:
+                if retries <= 0:
+                    raise err
+                retries -= 1
+                LOGGER.warning("Unable to interview Node %s: %s", node_id, err)
+                await asyncio.sleep(5)
+            else:
+                break
+
+        if task := self._setup_node_create_task(node_id):
+            await task
+
+        if fabric_label:
+            try:
+                await self.update_fabric_label(node_id, fabric_label)
+            except Exception as err:  # noqa: BLE001  # pylint: disable=W0718
+                LOGGER.warning(
+                    "Failed to set fabric label for node %s: %s", node_id, err
+                )
+
+        LOGGER.info(
+            "Multi-fabric commissioning of Node ID %s completed. "
+            "Device is now on multiple fabrics.",
+            node_id,
+        )
         return self.get_node(node_id)
 
     @api_command(APICommand.SET_WIFI_CREDENTIALS)
@@ -696,6 +818,233 @@ class MatterDeviceController:
             )
             for x in resolved_results
         ]
+
+    @staticmethod
+    def _format_ble_bytes(data: bytes) -> str:
+        """Format bytes as a space-separated hex string."""
+        return " ".join(f"{b:02X}" for b in data)
+
+    @staticmethod
+    def _parse_matter_adv_data(
+        data: bytes,
+    ) -> tuple[int | None, int | None, int | None]:
+        """Parse Matter BLE service data (fff6) and return (discriminator, vendor_id, product_id).
+
+        Matter Core Spec §5.4.2.5 BLE payload layout (8 bytes):
+          Byte 0:   flags (bit 0 = has additional data flag)
+          Bits 4-15 (across bytes 0-1): 12-bit discriminator
+          Bytes 2-3: Vendor ID (little-endian)
+          Bytes 4-5: Product ID (little-endian)
+        """
+        if len(data) < 8:
+            return None, None, None
+        discriminator = ((data[1] & 0x0F) << 8) | (data[0] >> 4)
+        vendor_id = data[2] | (data[3] << 8)
+        product_id = data[4] | (data[5] << 8)
+        return discriminator, vendor_id, product_id
+
+    @api_command(APICommand.SCAN_BLE_DEVICES)
+    async def scan_ble_devices(  # pylint: disable=too-many-locals
+        self,
+        mac_address: str | None = None,
+        scan_timeout: float = 5.0,
+    ) -> list[BLEScanResult]:
+        """Scan for nearby BLE devices and return raw advertisement data.
+
+        :param mac_address: If provided, only return results for this MAC address.
+        :param scan_timeout: Scan duration in seconds. Use 20-30s for reliable discovery
+                        since Matter devices advertise periodically.
+        :return: List of BLEScanResult. When is_matter=True the device is in
+                 Matter commissioning mode and can be commissioned via commission_with_mac.
+        """
+        try:
+            from bleak import BleakScanner  # noqa: PLC0415  # pylint: disable=C0415
+        except ImportError as err:
+            raise RuntimeError(
+                "bleak library is required for BLE scanning. "
+                "Install it with: pip install bleak"
+            ) from err
+
+        mac_filter = mac_address.lower() if mac_address else None
+
+        LOGGER.info(
+            "Starting BLE scan (timeout=%.1fs, mac_filter=%s)",
+            scan_timeout,
+            mac_filter or "none",
+        )
+        devices = await BleakScanner.discover(timeout=scan_timeout, return_adv=True)
+
+        results = []
+        for address, (device, adv) in devices.items():
+            if mac_filter and address.lower() != mac_filter:
+                continue
+
+            is_matter = False
+            discriminator = vendor_id = product_id = None
+            for uuid, svc_data in (adv.service_data or {}).items():
+                if _MATTER_BLE_SERVICE_UUID in uuid.lower():
+                    is_matter = True
+                    discriminator, vendor_id, product_id = self._parse_matter_adv_data(
+                        svc_data
+                    )
+
+            results.append(
+                BLEScanResult(
+                    address=device.address,
+                    name=device.name,
+                    rssi=adv.rssi,
+                    service_uuids=list(adv.service_uuids or []),
+                    service_data={
+                        k: self._format_ble_bytes(v)
+                        for k, v in (adv.service_data or {}).items()
+                    },
+                    manufacturer_data={
+                        k: self._format_ble_bytes(v)
+                        for k, v in (adv.manufacturer_data or {}).items()
+                    },
+                    is_matter=is_matter,
+                    matter_discriminator=discriminator,
+                    matter_vendor_id=vendor_id,
+                    matter_product_id=product_id,
+                )
+            )
+
+        LOGGER.debug("BLE scan found %s device(s) matching filter", len(results))
+        return results
+
+    @api_command(APICommand.COMMISSION_WITH_MAC)
+    async def commission_with_mac(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
+        self,
+        mac_address: str,
+        setup_pin_code: int,
+        scan_timeout: float = 30.0,
+        fabric_label: str | None = None,
+    ) -> MatterNodeData:
+        """Commission a Matter device by its BLE MAC address and setup PIN code.
+
+        Scans for the device (up to scan_timeout seconds), extracts the discriminator
+        from the Matter BLE advertisement (fff6 service data), then commissions it
+        using any pre-set WiFi/Thread credentials.
+
+        The device MUST be in commissioning mode (fff6 service UUID present).
+        Set WiFi/Thread credentials first via set_wifi_credentials / set_thread_dataset.
+
+        :param mac_address: BLE MAC address of the target device (e.g. "50:3D:D1:C0:5B:AB").
+        :param setup_pin_code: The device's setup PIN code (from device label or QR code).
+        :param scan_timeout: How long to scan for the device in seconds (default 30.0).
+        :param fabric_label: Optional label to identify our fabric on the device.
+        :return: The commissioned MatterNodeData.
+        """
+        if not self.server.bluetooth_enabled:
+            raise NodeCommissionFailed(
+                "Bluetooth commissioning is not available on this server."
+            )
+
+        try:
+            from bleak import BleakScanner  # noqa: PLC0415  # pylint: disable=C0415
+        except ImportError as err:
+            raise RuntimeError(
+                "bleak library is required for BLE scanning. "
+                "Install it with: pip install bleak"
+            ) from err
+
+        mac_filter = mac_address.lower()
+
+        LOGGER.info(
+            "Scanning for BLE device %s to commission (timeout=%.1fs)",
+            mac_address,
+            scan_timeout,
+        )
+        devices = await BleakScanner.discover(timeout=scan_timeout, return_adv=True)
+
+        target_device = None
+        discriminator = None
+        for address, (device, adv) in devices.items():
+            if address.lower() != mac_filter:
+                continue
+            for uuid, svc_data in (adv.service_data or {}).items():
+                if _MATTER_BLE_SERVICE_UUID in uuid.lower():
+                    discriminator, _, _ = self._parse_matter_adv_data(svc_data)
+                    target_device = device
+                    break
+            if target_device:
+                break
+
+        if target_device is None:
+            raise NodeCommissionFailed(
+                f"Device {mac_address} was not found during BLE scan. "
+                "Ensure the device is powered on, in range, and try increasing scan_timeout."
+            )
+
+        if discriminator is None:
+            raise NodeCommissionFailed(
+                f"Device {mac_address} is not in Matter commissioning mode "
+                "(no fff6 Matter service UUID in advertisement). "
+                "Hold the device button to open a commissioning window, then retry."
+            )
+
+        LOGGER.info(
+            "Found device %s (name=%s) with discriminator=%s. Commissioning as node...",
+            mac_address,
+            target_device.name,
+            discriminator,
+        )
+
+        node_id = self._get_next_node_id()
+        try:
+            commissioned_node_id = await self._chip_device_controller.commission_ble(
+                node_id=node_id,
+                setup_pin_code=setup_pin_code,
+                discriminator=discriminator,
+                is_short_discriminator=False,
+                wifi_credentials=self._wifi_credentials,
+                thread_dataset=self._thread_dataset,
+            )
+        except ChipStackError as err:
+            raise NodeCommissionFailed(
+                f"BLE commissioning failed for device {mac_address} (node {node_id})."
+            ) from err
+
+        if commissioned_node_id != node_id:
+            raise RuntimeError("Returned Node ID must match requested Node ID")
+
+        LOGGER.info("Matter commissioning of Node ID %s successful.", node_id)
+
+        retries = 3
+        while retries:
+            try:
+                await self._interview_node(node_id)
+            except (NodeNotResolving, NodeInterviewFailed) as err:
+                if retries <= 0:
+                    try:
+                        await self._chip_device_controller.unpair_device(node_id)
+                    except ChipStackError as err_unpair:
+                        LOGGER.warning(
+                            "Removing current fabric from device failed: %s", err_unpair
+                        )
+                    raise err
+                retries -= 1
+                LOGGER.warning("Unable to interview Node %s: %s", node_id, err)
+                await asyncio.sleep(5)
+            else:
+                break
+
+        if task := self._setup_node_create_task(node_id):
+            await task
+
+        # Set fabric label if requested
+        if fabric_label:
+            try:
+                await self.update_fabric_label(node_id, fabric_label)
+            except Exception as err:  # noqa: BLE001  # pylint: disable=W0718
+                LOGGER.warning(
+                    "Failed to set fabric label for node %s: %s", node_id, err
+                )
+
+        LOGGER.info(
+            "Commissioning of Node ID %s via MAC %s completed.", node_id, mac_address
+        )
+        return self.get_node(node_id)
 
     async def _interview_node(self, node_id: int) -> None:
         try:
@@ -1114,6 +1463,7 @@ class MatterDeviceController:
             node_id,
             endpoint,
             Clusters.Groups.Commands.AddGroup(groupID=group_id, groupName=group_name),
+            timed_request_timeout_ms=5000,
         )
 
     @api_command(APICommand.GROUP_REMOVE)
@@ -1487,7 +1837,7 @@ class MatterDeviceController:
                     epochStartTime0=0,
                 )
             ),
-            timed_request_timeout_ms=1000,
+            timed_request_timeout_ms=5000,
         )
 
     @api_command(APICommand.GROUP_BIND_KEY_SET)
@@ -1529,6 +1879,7 @@ class MatterDeviceController:
                     Clusters.GroupKeyManagement.Attributes.GroupKeyMap(new_map),
                 )
             ],
+            timed_request_timeout_ms=5000,
         )
 
     @api_command(APICommand.INIT_GROUP_TESTING_DATA)

@@ -435,12 +435,14 @@ class ChipDeviceControllerWrapper:
         self,
         node_id: int,
         attributes: list[tuple[int, Clusters.ClusterAttributeDescriptor]],
+        timed_request_timeout_ms: int | None = None,
     ) -> list[AttributeWriteResult] | None:
         """Write an attribute on a target node."""
         async with self._get_node_lock(node_id):
             result = await self._chip_controller.WriteAttribute(
                 nodeid=node_id,
                 attributes=attributes,
+                timedWriteTimeoutMs=timed_request_timeout_ms,
             )
         return cast(list[AttributeWriteResult], result)
 

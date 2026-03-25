@@ -39,6 +39,7 @@ server = [
   "orjson==3.11.7",
   "zeroconf==0.148.0",
   "home-assistant-chip-core==2025.7.0",
+  "bleak>=0.21.0",
 ]
 test = [
   "aioresponses==0.7.8",
