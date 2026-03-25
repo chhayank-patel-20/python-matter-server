@@ -20,6 +20,7 @@
 - [x] Add `commission_with_mac` API command: scans for device by MAC, auto-extracts discriminator from fff6 advertisement, commissions via existing `commission_ble` flow. No QR code needed.
 - [x] Add Multi-Fabric Commissioning support: new `commission_on_commissioning_window` command + `fabric_label` parameter on all commissioning commands.
 - [x] Fix `group_add` failures: added `timed_request_timeout_ms=5000` to `AddGroup` send_command, added timed-write support to `write_attribute` in `sdk.py` + `group_bind_key_set`, increased `group_add_key_set` timeout from 1000ms to 5000ms.
+- [x] Fix `group_send_command` silent failures: fixed early-return guard for test group IDs (257+) and set `epochStartTime0=1` for non-test groups (satisfies Matter spec §11.2.6.1.1).
 
 ## Backlog
 - [ ] Add `discover` command to `scripts/cli_client.py`.

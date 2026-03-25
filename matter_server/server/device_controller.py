@@ -1602,10 +1602,12 @@ class MatterDeviceController:
             # 0xFFFF = kInvalidKeysetId (keyset ID 0 is reserved for the IPK)
             invalid_id = 0xFFFF
 
-            group_key_name = f"f/{fabric_idx:x}/g/{group.group_id:x}"
-            if storage.GetSdkKey(group_key_name) is not None:
-                # Already exists
+            if group.keyset_id is not None:
+                # Already have keys generated and injected
                 return
+
+            group_key_name = f"f/{fabric_idx:x}/g/{group.group_id:x}"
+            group_info_exists = storage.GetSdkKey(group_key_name) is not None
 
             # Generate new keyset_id and epoch_key if not present
             if group.keyset_id is None:
@@ -1652,20 +1654,23 @@ class MatterDeviceController:
             old_first_keyset = fabric_data.get(5, invalid_id)
             old_keyset_count = fabric_data.get(6, 0)
 
-            # 2. Write GroupInfo (tags: 1=name, 2=first_endpoint, 3=endpoint_count, 4=next)
-            writer = TLVWriter()
-            writer.put(
-                None,
-                {
-                    1: group.group_name[:16],  # name (max 16 chars)
-                    2: tlv_uint(0xFFFF),  # first_endpoint = kInvalidEndpointId
-                    3: tlv_uint(0),  # endpoint_count
-                    4: tlv_uint(old_first_group),  # next group_id in linked list
-                },
-            )
-            storage.SetSdkKey(group_key_name, writer.encoding)
-            fabric_data[1] = tlv_uint(group.group_id)
-            fabric_data[2] = tlv_uint(old_group_count + 1)
+            # 2. Write GroupInfo if it doesn't already exist
+            # (only when it doesn't already exist, to avoid corrupting the C++-written linked list)
+            if not group_info_exists:
+                writer = TLVWriter()
+                writer.put(
+                    None,
+                    {
+                        1: group.group_name[:16],
+                        2: tlv_uint(0xFFFF),  # endpoint (0xFFFF = all)
+                        3: tlv_uint(0),  # group index (0 = kUndefinedGroupId)
+                        4: tlv_uint(old_first_group),  # next pointer
+                    },
+                )
+                storage.SetSdkKey(group_key_name, writer.encoding)
+                # Update first_group to us and bump group count
+                fabric_data[1] = tlv_uint(group.group_id)
+                fabric_data[2] = tlv_uint(old_group_count + 1)
 
             # 3. Write Keyset (tags: 1=policy, 2=keys_count, 3=array[3], 7=next)
             # IMPORTANT: array must have EXACTLY 3 items (kEpochKeysMax).
@@ -1834,7 +1839,7 @@ class MatterDeviceController:
                     groupKeySetID=keyset_id,
                     groupKeySecurityPolicy=Clusters.GroupKeyManagement.Enums.GroupKeySecurityPolicyEnum.kTrustFirst,
                     epochKey0=key,
-                    epochStartTime0=0,
+                    epochStartTime0=1,
                 )
             ),
             timed_request_timeout_ms=5000,

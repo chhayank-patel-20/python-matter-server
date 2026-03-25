@@ -141,3 +141,13 @@ The previous TLV injection stored the raw epoch key as `TagKeyValue` (tag 6) and
 ### 3. Increase `group_add_key_set` timed timeout from 1000ms to 5000ms
 - **Decision**: Changed `timed_request_timeout_ms` from `1000` to `5000` in `group_add_key_set`.
 - **Rationale**: 1 second was too tight for `KeySetWrite` over a wireless path, causing silent failures (exceptions caught as warnings in `group_add`) before the key was actually provisioned.
+
+## 2026-03-25: group_send_command Fixes (Test and Non-Test Groups)
+
+### 1. Fix early-return guard for Test Group IDs (257/258/259)
+- **Decision**: Changed the early-return guard in `_ensure_controller_group_keys` from checking for the existence of the `GroupInfo` SDK key to checking if `group.keyset_id` is already set. Added conditional logic to only write `GroupInfo` and increment the group count if it doesn't already exist.
+- **Rationale**: `init_group_testing_data()` creates `GroupInfo` entries for test groups at startup. The previous guard would see these entries and return early before generating keys or setting `keyset_id`, causing node provisioning to be skipped. The new logic ensures keys are always generated while avoiding circular references in the linked list for groups already initialized by the SDK.
+
+### 2. Fix `InvalidCommand` (0x85) for Non-Test Groups
+- **Decision**: Updated `group_add_key_set` to use `epochStartTime0=1` instead of `0`.
+- **Rationale**: Per Matter Core Spec §11.2.6.1.1, if `EpochKey0` is not null, `EpochStartTime0` must be a non-zero value. Real devices (like Tapo) strictly enforce this and reject `KeySetWrite` with `InvalidCommand` if it is zero. Setting it to `1` (1 microsecond past the Matter epoch) satisfies the spec and allows successful key provisioning.
