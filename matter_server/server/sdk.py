@@ -442,7 +442,7 @@ class ChipDeviceControllerWrapper:
             result = await self._chip_controller.WriteAttribute(
                 nodeid=node_id,
                 attributes=attributes,
-                timedWriteTimeoutMs=timed_request_timeout_ms,
+                timedRequestTimeoutMs=timed_request_timeout_ms,
             )
         return cast(list[AttributeWriteResult], result)
 
