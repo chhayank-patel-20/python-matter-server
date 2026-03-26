@@ -873,8 +873,11 @@ is queried directly from the device with `group_get_membership`.
 The server:
 1. Validates the endpoint supports the Groups cluster via `Descriptor.ServerList`
 2. Generates a random 128-bit epoch key for the group (first time only) and injects it into the controller's `GroupDataProvider`
-3. Provisions the node via `GroupKeyManagement.KeySetWrite` + `GroupKeyMap`
-4. Sends `Groups.AddGroup` to the device endpoint
+3. Reads the device's `GroupKeyManagement.GroupKeyMap` to determine which keysets are already installed
+4. Calls `GroupKeyManagement.KeySetWrite` only if the keyset is **not** already on the device (avoids redundant writes and prevents `ResourceExhausted`)
+5. If the device keyset table is full (`ResourceExhausted`), reuses a server-managed keyset already present on the device
+6. Updates the device's `GroupKeyMap` to bind the group ID to the keyset
+7. Sends `Groups.AddGroup` to the device endpoint
 
 Call this once per endpoint/node you want to add to the group. Group membership is stored
 on the device — not on the server.
@@ -903,6 +906,9 @@ on the device — not on the server.
 
 **Errors:**
 - `InvalidArguments` — endpoint does not support the Groups cluster
+- `InvalidArguments` — device keyset table is full **and** no server-managed keyset is already installed on the device. Remove unused group memberships on the device first, then retry.
+
+> **Note on keyset reuse:** Devices typically support only 3 group keysets. `group_add` automatically reuses keysets across multiple groups when possible, so you can add more groups than the keyset limit. You only hit the error above in the rare case where the table is completely occupied by keysets the server did not create (e.g. keysets installed by another controller).
 
 **Typical workflow:**
 ```
@@ -1004,8 +1010,9 @@ the encryption keys for that group ID.
 
 **`group_add_key_set`** — Manually install a group key set on a node
 
-Sends `GroupKeyManagement.KeySetWrite` to the node's endpoint 0. This is called
-automatically by `group_add` — only use this for advanced/manual key management.
+Sends `GroupKeyManagement.KeySetWrite` to the node's endpoint 0.
+
+> **Advanced use only.** `group_add` handles key provisioning automatically, including skipping this call if the keyset is already on the device. Call this directly only if you need to install a specific keyset outside of the `group_add` workflow.
 
 ```json
 {
@@ -1031,8 +1038,9 @@ automatically by `group_add` — only use this for advanced/manual key managemen
 
 **`group_bind_key_set`** — Manually bind a group ID to a keyset on a node
 
-Writes to `GroupKeyManagement.GroupKeyMap` (attribute 0) on endpoint 0. This is called
-automatically by `group_add` — only use this for advanced/manual key management.
+Writes to `GroupKeyManagement.GroupKeyMap` (attribute 0) on endpoint 0.
+
+> **Advanced use only.** `group_add` updates the `GroupKeyMap` automatically after key provisioning. Call this directly only if you need to rebind a group to a different keyset outside of the `group_add` workflow.
 
 ```json
 {
