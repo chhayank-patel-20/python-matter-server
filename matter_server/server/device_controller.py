@@ -1613,7 +1613,7 @@ class MatterDeviceController:
                     privilege=Clusters.AccessControl.Enums.AccessControlEntryPrivilegeEnum.kOperate,
                     authMode=group_auth_mode,
                     subjects=[group_id],
-                    targets=None,
+                    targets=[],
                     fabricIndex=0,  # SDK fills this in
                 )
             )
