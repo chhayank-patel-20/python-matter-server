@@ -253,3 +253,17 @@ The previous TLV injection stored the raw epoch key as `TagKeyValue` (tag 6) and
 ### 3. `group_debug_info` extended with `provisioned_nodes_for_group`
 - **Decision**: Added `provisioned_nodes_for_group: dict[str, list[int]]` to the `group_debug_info` response, showing the contents of `_group_provisioned_nodes` for all non-empty groups.
 - **Rationale**: Gives developers visibility into which nodes the server will attempt to re-provision before groupcast, making it easier to diagnose why a node did or did not receive a re-provisioning attempt.
+
+## 2026-03-26: 3-Tier Keyset Cleanup (Brute-Force Fallback)
+
+### 1. Cleanup must never be skipped — even when device exposes nothing
+- **Decision**: `_cleanup_unused_keysets_on_node` now uses a 3-tier strategy. Tier 3 (brute-force) is mandatory: when neither `GroupKeyTable` nor the controller tracker yields any keyset IDs, iterate IDs 1–31 and call `KeySetRemove` on each. Errors (e.g. `NOT_FOUND` for non-existent IDs) are silently swallowed in brute-force mode only.
+- **Rationale**: The previous code returned 0 and logged "skipping cleanup" when both tiers were empty. This caused permanent keyset leaks on constrained devices that (a) do not expose `GroupKeyTable` and (b) have not been provisioned by this server (so the tracker is empty). The brute-force approach cannot cause harm — `KeySetRemove` on a non-existent ID returns `NOT_FOUND` and the device ignores it.
+
+### 2. Class-level constant `_BRUTE_FORCE_KEYSET_RANGE = range(1, 32)`
+- **Decision**: The brute-force range is defined as a class variable so it can be inspected and tested without running the full cleanup. The upper bound (31) covers all practical deployments; real devices have 3 keyset slots.
+- **Rationale**: Avoids a magic number scattered through the code and makes the range explicitly documentable.
+
+### 3. Brute-force errors are suppressed; non-brute-force errors are warnings
+- **Decision**: In the shared removal loop, `brute_force` flag distinguishes expected `NOT_FOUND` noise from unexpected failures. Non-brute-force failures still emit `LOGGER.warning` with full traceback.
+- **Rationale**: Prevents log spam of 31 `NOT_FOUND` exceptions on every `group_remove_all` call while preserving visibility into genuine removal failures.

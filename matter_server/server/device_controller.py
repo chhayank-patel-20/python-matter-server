@@ -1589,6 +1589,11 @@ class MatterDeviceController:
                 DATA_KEY_NODE_KEYSETS, sorted(tracked), subkey=str(node_id)
             )
 
+    # Safe keyset ID range for brute-force cleanup.
+    # Matter keyset IDs are uint16; 0 is the IPK (never removed).
+    # Real devices typically have 3 slots; 1-31 covers all practical cases.
+    _BRUTE_FORCE_KEYSET_RANGE: range = range(1, 32)
+
     async def _cleanup_unused_keysets_on_node(self, node_id: int) -> int:
         """Remove keysets on node that are no longer referenced by any group.
 
@@ -1597,17 +1602,33 @@ class MatterDeviceController:
         fixed-size keyset table (typically 3 slots), causing ResourceExhausted on the
         next KeySetWrite.
 
-        Algorithm:
-          1. Read GroupKeyTable (all provisioned keysets, fabric-scoped).
-          2. Read GroupKeyMap  (all group→keyset bindings, fabric-scoped).
-          3. Any keyset in GroupKeyTable that is NOT referenced by GroupKeyMap
-             (and is NOT the IPK, keyset_id=0) is orphaned → remove via KeySetRemove.
+        3-tier algorithm for discovering which keysets exist on the device:
+
+          Tier 1 — GroupKeyTable (preferred, spec-compliant):
+            Read GroupKeyManagement.Attributes.GroupKeyTable; not exposed by all devices.
+
+          Tier 2 — Controller tracker (_known_keysets_per_node):
+            Persistent record of every KeySetWrite this server has sent; used when the
+            device does not expose GroupKeyTable (e.g. Tapo).
+
+          Tier 3 — Brute-force (mandatory fallback):
+            If both tiers above yield no keyset IDs, iterate IDs 1-31 and attempt
+            KeySetRemove on each. Devices return NOT_FOUND for IDs that do not exist;
+            we catch and ignore all such errors. This MUST NOT be skipped — without it,
+            constrained devices that expose neither GroupKeyTable nor any tracker entries
+            accumulate orphaned keysets until ResourceExhausted.
+
+        Referenced keysets (present in GroupKeyMap) are never removed regardless of tier.
+        The IPK (keyset_id=0) is always excluded.
 
         Returns the number of keysets successfully removed.
         """
-        # 1. Get all provisioned keyset IDs — try GroupKeyTable on device first.
-        #    Many consumer devices (e.g. Tapo) do not expose GroupKeyTable; fall
-        #    back to the controller-tracked set in that case.
+        # Read GroupKeyMap first — always needed to find currently referenced keysets.
+        # After RemoveAllGroups this will be empty, which is expected.
+        entries = await self._get_node_group_key_map(node_id)
+        referenced_ids: set[int] = {e.groupKeySetID for e in entries}
+
+        # --- Tier 1: GroupKeyTable ---
         all_keyset_ids: set[int] = set()
         try:
             table_result = await self._chip_device_controller.read_attribute(
@@ -1625,31 +1646,42 @@ class MatterDeviceController:
                         Clusters.GroupKeyManagement.Attributes.GroupKeyTable  # pylint: disable=no-member
                     ]
                 }
-        except Exception:  # noqa: BLE001, S110  # pylint: disable=W0718
-            pass  # GroupKeyTable unavailable — fallback applied below
-
-        if not all_keyset_ids:
-            # Device did not expose GroupKeyTable — use the controller-side tracker.
-            all_keyset_ids = set(self._known_keysets_per_node.get(node_id, set()))
-            if all_keyset_ids:
                 LOGGER.debug(
-                    "GroupKeyTable unavailable on node %s — "
-                    "using controller-tracked keysets for cleanup: %s",
+                    "Tier-1 (GroupKeyTable) keyset IDs on node %s: %s",
                     node_id,
                     all_keyset_ids,
                 )
-            else:
+        except Exception:  # noqa: BLE001, S110  # pylint: disable=W0718
+            pass  # GroupKeyTable unavailable — try tier 2
+
+        # --- Tier 2: Controller tracker ---
+        if not all_keyset_ids:
+            tracked = set(self._known_keysets_per_node.get(node_id, set()))
+            if tracked:
+                all_keyset_ids = tracked
                 LOGGER.debug(
-                    "No keyset information available for node %s — skipping cleanup",
+                    "Tier-2 (controller tracker) keyset IDs on node %s: %s",
                     node_id,
+                    all_keyset_ids,
                 )
-                return 0
 
-        # 2. Find which keysets are still referenced by a group binding.
-        entries = await self._get_node_group_key_map(node_id)
-        referenced_ids: set[int] = {e.groupKeySetID for e in entries}
+        # --- Tier 3: Brute-force ---
+        brute_force = False
+        if not all_keyset_ids:
+            LOGGER.warning(
+                "Node %s: GroupKeyTable unavailable and controller tracker empty — "
+                "falling back to brute-force keyset removal (IDs %d-%d). "
+                "This is normal for constrained devices (e.g. Tapo) that do not "
+                "expose GroupKeyTable and have not been provisioned by this server.",
+                node_id,
+                self._BRUTE_FORCE_KEYSET_RANGE.start,
+                self._BRUTE_FORCE_KEYSET_RANGE.stop - 1,
+            )
+            all_keyset_ids = set(self._BRUTE_FORCE_KEYSET_RANGE)
+            brute_force = True
 
-        # 3. Orphaned = provisioned but not referenced; never remove IPK (id=0).
+        # Orphaned = present on device but not referenced by any active group binding;
+        # always exclude IPK (id=0).
         orphaned = all_keyset_ids - referenced_ids - {0}
         if not orphaned:
             return 0
@@ -1666,21 +1698,29 @@ class MatterDeviceController:
                     timed_request_timeout_ms=5000,
                 )
                 removed += 1
-                # Remove from controller tracker so it no longer shows as orphaned.
-                tracked = self._known_keysets_per_node.get(node_id)
-                if tracked is not None:
-                    tracked.discard(kid)
+                # Keep controller tracker in sync.
+                tracked_set = self._known_keysets_per_node.get(node_id)
+                if tracked_set is not None:
+                    tracked_set.discard(kid)
                     self.server.storage.set(
-                        DATA_KEY_NODE_KEYSETS, sorted(tracked), subkey=str(node_id)
+                        DATA_KEY_NODE_KEYSETS, sorted(tracked_set), subkey=str(node_id)
                     )
-                LOGGER.info("Removed orphaned keyset %s from node %s", kid, node_id)
-            except Exception:  # noqa: BLE001  # pylint: disable=W0718
-                LOGGER.warning(
-                    "Failed to remove keyset %s from node %s",
+                LOGGER.info(
+                    "%s keyset %s from node %s",
+                    "Brute-force removed" if brute_force else "Removed orphaned",
                     kid,
                     node_id,
-                    exc_info=True,
                 )
+            except Exception:  # noqa: BLE001  # pylint: disable=W0718
+                if not brute_force:
+                    LOGGER.warning(
+                        "Failed to remove keyset %s from node %s",
+                        kid,
+                        node_id,
+                        exc_info=True,
+                    )
+                # In brute-force mode NOT_FOUND is expected for IDs that don't exist;
+                # suppress all errors to avoid log spam.
 
         return removed
 

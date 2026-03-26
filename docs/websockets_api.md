@@ -868,7 +868,7 @@ is queried directly from the device with `group_list` or `group_get_membership`.
 
 **Server-side state (what the server does persist):**
 - `group_keys` — one entry per group ID: the epoch key and keyset ID used to encrypt groupcast frames. Required so the controller can send multicast after a restart without re-running `group_add` on every node.
-- `node_keysets` — per-node set of keyset IDs the server has explicitly written via `KeySetWrite`. Used as a fallback source for keyset cleanup on devices that do not expose `GroupKeyManagement.Attributes.GroupKeyTable` (e.g. Tapo).
+- `node_keysets` — per-node set of keyset IDs the server has explicitly written via `KeySetWrite`. Used as tier-2 fallback for keyset cleanup when the device does not expose `GroupKeyManagement.Attributes.GroupKeyTable` (e.g. Tapo).
 - `group_nodes` — per-group set of node IDs that have been provisioned via `group_add`. Used by `group_send_command` to verify device-side keyset presence before sending multicast (automatic re-provisioning if needed).
 
 Everything else (group membership, group names, keyset bindings) lives on the device.
@@ -921,7 +921,7 @@ on the device — not on the server.
 
 > **Automatic FIFO eviction:** If `GetGroupMembership` reports `remaining_capacity == 0`, `group_add` automatically removes the oldest group on that endpoint before adding the new one. Use `group_list` first if you want to choose which group to remove manually.
 >
-> **Automatic keyset cleanup on ResourceExhausted:** If `KeySetWrite` fails with `ResourceExhausted`, the server calls `KeySetRemove` on all orphaned keysets and retries before falling back to keyset reuse. Orphaned keysets are discovered via `GroupKeyTable` if the device exposes it; otherwise the server falls back to its own `node_keysets` tracker.
+> **Automatic keyset cleanup on ResourceExhausted:** If `KeySetWrite` fails with `ResourceExhausted`, the server calls `KeySetRemove` on all orphaned keysets and retries before falling back to keyset reuse. See `group_remove_all` for the 3-tier cleanup strategy used.
 >
 > **Keyset reuse:** Devices typically support only 3 group keysets. `group_add` reuses existing keysets across multiple groups so you can manage more groups than the keyset limit.
 
@@ -939,7 +939,7 @@ group_add(node_id=3, endpoint=1, group_id=100, group_name="Lights")
 
 Sends `Groups.RemoveGroup` to the device, then automatically removes any keysets that are no longer referenced by any group on that node.
 
-> **Matter spec note:** `RemoveGroup` clears the group membership entry but does **not** remove the associated keyset. The server calls `KeySetRemove` on any keyset that is no longer referenced by a group binding. Orphaned keysets are discovered via `GroupKeyTable` first; if unavailable, the server falls back to its `node_keysets` tracker.
+> **Matter spec note:** `RemoveGroup` clears the group membership entry but does **not** remove the associated keyset. The server runs `_cleanup_unused_keysets_on_node` after every removal — see `group_remove_all` for the 3-tier cleanup strategy.
 
 ```json
 {
@@ -959,9 +959,13 @@ Sends `Groups.RemoveGroup` to the device, then automatically removes any keysets
 
 **`group_remove_all`** — Remove all groups from a node endpoint
 
-Sends `Groups.RemoveAllGroups` to the device, then automatically removes all orphaned keysets.
+Sends `Groups.RemoveAllGroups` to the device, then automatically removes all orphaned keysets using a 3-tier strategy:
 
-> **Matter spec note:** `RemoveAllGroups` clears the group table but does **not** remove keysets. The server tries to read `GroupKeyTable` to discover provisioned keysets; if the device does not expose it (e.g. Tapo), it falls back to the controller-side keyset tracker. It then calls `KeySetRemove` on every keyset no longer referenced by a group binding. After this call the node's keyset slots are fully reclaimed.
+1. **Tier 1 — `GroupKeyTable`** (preferred): reads the device's full keyset table. Spec-compliant devices expose this; subtract any still-referenced keysets and remove orphans.
+2. **Tier 2 — controller tracker** (`node_keysets`): if the device does not expose `GroupKeyTable` (e.g. Tapo), use the server's persistent record of every `KeySetWrite` it sent to this node.
+3. **Tier 3 — brute-force** (mandatory fallback): if both tiers above produce no keyset IDs, iterate IDs 1–31 and call `KeySetRemove` on each. Devices return `NOT_FOUND` for IDs that do not exist — those errors are silently ignored. This tier is never skipped, ensuring keyset slots are always reclaimed even on fully constrained devices.
+
+> After this call the node's keyset slots are fully reclaimed regardless of how much the device exposes about its internal state.
 
 ```json
 {
