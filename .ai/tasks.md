@@ -39,6 +39,7 @@
 - [x] Fix ResourceExhausted fallback reuse: only reuse keysets confirmed by both GroupKeyMap AND tracker.
 - [x] Fix `send_group_command` 0xAC comment: clarify that re-injection is controller-side only (SetSdkKey ≠ KeySetWrite). Log warning to call `group_add` if device ignores the command after retry.
 - [x] Add pre-send device-key verification to `send_group_command`: added `_group_provisioned_nodes` tracker (persisted as `group_nodes`), `group_add` records node after AddGroup, `send_group_command` re-provisions any node missing from `_known_keysets_per_node` before multicast. Updated `group_remove`/`group_remove_all` to clean up tracker. Updated `group_debug_info` to include `provisioned_nodes_for_group`.
+- [x] Fix send_group_command operational fragility: replaced tracker-conditional skip with always-call `_ensure_keyset_on_node` (unconditional `KeySetWrite`). `KeySetWrite` is idempotent — device overwrites in-place if keyset exists. Eliminates silent drops after device reboot/reset where `_known_keysets_per_node` drifted from device truth.
 
 ## Backlog
 - [ ] Add `discover` command to `scripts/cli_client.py`.

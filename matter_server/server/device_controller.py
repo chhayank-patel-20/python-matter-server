@@ -2178,8 +2178,34 @@ class MatterDeviceController:
         except (KeyError, TypeError):
             return False
 
+    async def _ensure_keyset_on_node(
+        self, node_id: int, keyset_id: int, epoch_key_hex: str
+    ) -> None:
+        """Unconditionally write the keyset to the node via KeySetWrite.
+
+        KeySetWrite is safe to call even when the keyset already exists on the
+        device — the device will overwrite the entry in-place, preserving the
+        same encryption material.  This eliminates the need to guess device
+        state from controller-side trackers (_known_keysets_per_node), which
+        can drift after a device reboot, firmware update, or factory reset.
+
+        Any failure is logged as a warning.  The caller must still attempt the
+        groupcast so that reachable nodes are not penalised for one node being
+        offline.
+        """
+        try:
+            await self.group_add_key_set(node_id, keyset_id, epoch_key_hex)
+        except Exception as err:  # noqa: BLE001  # pylint: disable=W0718
+            LOGGER.warning(
+                "Failed to ensure keyset %s on node %s before groupcast: %s. "
+                "Groupcast to this node may be silently dropped.",
+                keyset_id,
+                node_id,
+                err,
+            )
+
     @api_command(APICommand.GROUP_SEND_COMMAND)
-    async def send_group_command(  # pylint: disable=too-many-locals
+    async def send_group_command(
         self,
         group_id: int,
         cluster_id: int,
@@ -2197,37 +2223,19 @@ class MatterDeviceController:
         command_cls = getattr(cluster_cls.Commands, command_name)
         command = dataclass_from_dict(command_cls, payload, allow_sdk_types=True)
 
-        # Pre-send: verify every provisioned node has the keyset installed on the device.
-        # Without this, multicast frames are silently dropped by nodes that are missing
-        # the keyset (e.g. after a device reset or factory restore).
+        # Pre-send: enforce keyset presence on every provisioned node.
+        # We call KeySetWrite unconditionally — do NOT skip based on the
+        # controller-side tracker (_known_keysets_per_node).  The tracker is
+        # a controller-side assumption and can drift after a device reboot,
+        # firmware update, or factory reset.  KeySetWrite is idempotent: the
+        # device overwrites the entry in-place if the keyset already exists,
+        # so calling it again is always safe.
         if group_id in self._group_key_store:
             keyset_id_check, epoch_key_hex_check = self._group_key_store[group_id]
-            provisioned_nodes = set(self._group_provisioned_nodes.get(group_id, set()))
-            needs_reprovision = {
-                nid
-                for nid in provisioned_nodes
-                if keyset_id_check not in self._known_keysets_per_node.get(nid, set())
-            }
-            for nid in needs_reprovision:
-                LOGGER.info(
-                    "Node %s is provisioned for group %s but keyset_id %s is not in "
-                    "controller tracker — re-provisioning before groupcast",
-                    nid,
-                    group_id,
-                    keyset_id_check,
+            for nid in set(self._group_provisioned_nodes.get(group_id, set())):
+                await self._ensure_keyset_on_node(
+                    nid, keyset_id_check, epoch_key_hex_check
                 )
-                try:
-                    await self._provision_group_keys_on_node(
-                        nid, group_id, keyset_id_check, epoch_key_hex_check
-                    )
-                except (ChipStackError, InteractionModelError) as repro_err:
-                    LOGGER.warning(
-                        "Failed to re-provision node %s for group %s before groupcast: %s. "
-                        "That node may not respond to the group command.",
-                        nid,
-                        group_id,
-                        repro_err,
-                    )
 
         try:
             await self._chip_device_controller.send_group_command(group_id, command)

@@ -1072,7 +1072,7 @@ the encryption keys for that group ID.
 
 **Send flow (automatic, no client action needed):**
 1. Check that the controller has encryption keys for this group ID (from `group_keys` store).
-2. For every node recorded in `group_nodes` for this group: if the controller tracker (`node_keysets`) does not confirm that `KeySetWrite` was sent to that node, re-provision it by calling `_provision_group_keys_on_node` (which sends `KeySetWrite` to the device). This ensures silent drops due to device-side missing keysets are fixed automatically before multicast.
+2. For every node recorded in `group_nodes` for this group: call `KeySetWrite` unconditionally — do **not** skip based on the controller-side `node_keysets` tracker. `KeySetWrite` is idempotent: the device overwrites the entry in-place if the keyset already exists, so calling it again is always safe. This defends against device-side key loss after a reboot, firmware update, or factory reset, which the controller tracker cannot detect. Failures (node offline, etc.) are logged as warnings and do not block the multicast for other nodes.
 3. Send the encrypted multicast frame to the group.
 
 ```json
@@ -1101,8 +1101,8 @@ the encryption keys for that group ID.
 > There is no confirmation that individual nodes received or executed the command.
 
 **Common Errors:**
-- `CHIP Error 0xAC (Internal Error)` — The **controller** lacks encryption keys for this group ID in its local SDK storage (e.g. after a server restart before re-provisioning ran). The server automatically re-injects the keys and retries once. The pre-send re-provisioning step (see Send flow above) normally prevents this for nodes tracked in `group_nodes`. If groupcast still has no effect after the retry, call `group_add` again on each affected node to force `KeySetWrite`.
-- `CHIP Error 0x32 (Timeout)` — A CASE session could not be established with a node during pre-send re-provisioning (mDNS lookup failed or device is offline). The server logs a warning and proceeds with the multicast; that specific node may not respond. Other online nodes are unaffected.
+- `CHIP Error 0xAC (Internal Error)` — The **controller** lacks encryption keys for this group ID in its local SDK storage (e.g. after a server restart). The server automatically re-injects the keys and retries once. The pre-send `KeySetWrite` step normally prevents device-side key loss from causing silent drops. If groupcast still has no effect after the retry, call `group_add` again on each affected node.
+- `CHIP Error 0x32 (Timeout)` — A CASE session could not be established with a node during the pre-send `KeySetWrite` phase (mDNS lookup failed or device is offline). The server logs a warning and proceeds with the multicast; that specific node may not respond. Other online nodes are unaffected.
 
 ---
 
