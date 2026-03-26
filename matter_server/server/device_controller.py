@@ -92,6 +92,7 @@ if TYPE_CHECKING:
 
 DATA_KEY_NODES = "nodes"
 DATA_KEY_GROUP_KEYS = "group_keys"
+DATA_KEY_NODE_KEYSETS = "node_keysets"  # node_id → [keyset_id, ...] controller-tracked
 DATA_KEY_LAST_NODE_ID = "last_node_id"
 _MATTER_BLE_SERVICE_UUID = "0000fff6-0000-1000-8000-00805f9b34fb"
 
@@ -190,6 +191,9 @@ class MatterDeviceController:
         # Keys are injected into controller KVS so SendGroupCommand can encrypt frames.
         # Membership is stored on devices (via Groups cluster), NOT here.
         self._group_key_store: dict[int, tuple[int, str]] = {}
+        # Controller-side keyset tracker: node_id → set of keyset_ids we have written.
+        # Used as fallback source for cleanup when GroupKeyTable is unavailable on the device.
+        self._known_keysets_per_node: dict[int, set[int]] = {}
         self._custom_attribute_poller_timer: asyncio.TimerHandle | None = None
         self._custom_attribute_poller_task: asyncio.Task | None = None
         self._attribute_update_callbacks: dict[int, list[Callable]] = {}
@@ -216,6 +220,16 @@ class MatterDeviceController:
                 key_dict["epoch_key_hex"],
             )
         LOGGER.info("Loaded %d group key entries", len(self._group_key_store))
+
+        # Load controller-side keyset tracking (fallback for devices without GroupKeyTable).
+        stored_node_keysets: dict[str, list[int]] = self.server.storage.get(
+            DATA_KEY_NODE_KEYSETS, {}
+        )
+        for nid_str, keyset_list in stored_node_keysets.items():
+            self._known_keysets_per_node[int(nid_str)] = set(keyset_list)
+        LOGGER.info(
+            "Loaded keyset tracking for %d nodes", len(self._known_keysets_per_node)
+        )
 
         # load nodes from persistent storage
         nodes: dict[str, dict | None] = self.server.storage.get(DATA_KEY_NODES, {})
@@ -1537,6 +1551,19 @@ class MatterDeviceController:
         remaining: int | None = raw_cap if isinstance(raw_cap, int) else None
         return group_ids, remaining
 
+    def _record_keyset_on_node(self, node_id: int, keyset_id: int) -> None:
+        """Mark keyset_id as present on node_id in the controller tracker.
+
+        Called whenever we confirm a keyset is installed (skipped write, reuse, etc.)
+        so that cleanup has accurate state even when GroupKeyTable is unavailable.
+        """
+        tracked = self._known_keysets_per_node.setdefault(node_id, set())
+        if keyset_id not in tracked:
+            tracked.add(keyset_id)
+            self.server.storage.set(
+                DATA_KEY_NODE_KEYSETS, sorted(tracked), subkey=str(node_id)
+            )
+
     async def _cleanup_unused_keysets_on_node(self, node_id: int) -> int:
         """Remove keysets on node that are no longer referenced by any group.
 
@@ -1553,7 +1580,10 @@ class MatterDeviceController:
 
         Returns the number of keysets successfully removed.
         """
-        # 1. Read all provisioned keysets from the device.
+        # 1. Get all provisioned keyset IDs — try GroupKeyTable on device first.
+        #    Many consumer devices (e.g. Tapo) do not expose GroupKeyTable; fall
+        #    back to the controller-tracked set in that case.
+        all_keyset_ids: set[int] = set()
         try:
             table_result = await self._chip_device_controller.read_attribute(
                 node_id=node_id,
@@ -1561,23 +1591,34 @@ class MatterDeviceController:
                     (0, Clusters.GroupKeyManagement.Attributes.GroupKeyTable)  # pylint: disable=no-member
                 ],
             )
-            if table_result is None or table_result.attributes is None:
-                return 0
-            all_keyset_ids: set[int] = {
-                entry.groupKeySetID
-                for entry in table_result.attributes[0][Clusters.GroupKeyManagement][
-                    Clusters.GroupKeyManagement.Attributes.GroupKeyTable  # pylint: disable=no-member
-                ]
-            }
-        except Exception:  # noqa: BLE001  # pylint: disable=W0718
-            LOGGER.debug(
-                "Could not read GroupKeyTable from node %s — skipping keyset cleanup",
-                node_id,
-            )
-            return 0
+            if table_result is not None and table_result.attributes is not None:
+                all_keyset_ids = {
+                    entry.groupKeySetID
+                    for entry in table_result.attributes[0][
+                        Clusters.GroupKeyManagement
+                    ][
+                        Clusters.GroupKeyManagement.Attributes.GroupKeyTable  # pylint: disable=no-member
+                    ]
+                }
+        except Exception:  # noqa: BLE001, S110  # pylint: disable=W0718
+            pass  # GroupKeyTable unavailable — fallback applied below
 
         if not all_keyset_ids:
-            return 0
+            # Device did not expose GroupKeyTable — use the controller-side tracker.
+            all_keyset_ids = set(self._known_keysets_per_node.get(node_id, set()))
+            if all_keyset_ids:
+                LOGGER.debug(
+                    "GroupKeyTable unavailable on node %s — "
+                    "using controller-tracked keysets for cleanup: %s",
+                    node_id,
+                    all_keyset_ids,
+                )
+            else:
+                LOGGER.debug(
+                    "No keyset information available for node %s — skipping cleanup",
+                    node_id,
+                )
+                return 0
 
         # 2. Find which keysets are still referenced by a group binding.
         entries = await self._get_node_group_key_map(node_id)
@@ -1600,6 +1641,13 @@ class MatterDeviceController:
                     timed_request_timeout_ms=5000,
                 )
                 removed += 1
+                # Remove from controller tracker so it no longer shows as orphaned.
+                tracked = self._known_keysets_per_node.get(node_id)
+                if tracked is not None:
+                    tracked.discard(kid)
+                    self.server.storage.set(
+                        DATA_KEY_NODE_KEYSETS, sorted(tracked), subkey=str(node_id)
+                    )
                 LOGGER.info("Removed orphaned keyset %s from node %s", kid, node_id)
             except Exception:  # noqa: BLE001  # pylint: disable=W0718
                 LOGGER.warning(
@@ -1675,13 +1723,18 @@ class MatterDeviceController:
                 node_id,
                 keyset_id,
             )
+            # We know the keyset is on the device — make sure the tracker reflects this.
+            self._record_keyset_on_node(node_id, keyset_id)
             return
 
         # 3 & 4. Write keyset only if it is not already installed on the device.
         actual_keyset_id = keyset_id
         actual_epoch_key_hex = epoch_key_hex
 
-        if keyset_id not in device_keyset_ids:
+        if keyset_id in device_keyset_ids:
+            # Keyset already on device — just record it in the tracker.
+            self._record_keyset_on_node(node_id, keyset_id)
+        else:
             write_error: InteractionModelError | None = None
             try:
                 await self.group_add_key_set(node_id, keyset_id, epoch_key_hex)
@@ -1730,6 +1783,8 @@ class MatterDeviceController:
                     actual_keyset_id,
                     group_id,
                 )
+                # We confirmed this keyset is on the device — record it in the tracker.
+                self._record_keyset_on_node(node_id, actual_keyset_id)
 
                 # Persist the remapped keyset so future provisioning uses the same one.
                 if self._group_key_store.get(group_id) != (
@@ -1859,6 +1914,30 @@ class MatterDeviceController:
             Clusters.Groups.Commands.GetGroupMembership([]),
         )
         return cast(list[int], read_result.groupList)
+
+    @api_command(APICommand.GROUP_DEBUG_INFO)
+    async def group_debug_info(self, node_id: int) -> dict[str, Any]:
+        """Return raw group key state for a node — useful for diagnosing groupcast issues.
+
+        Reports the device's GroupKeyMap (live read), the controller-tracked keysets
+        for this node, and which keysets the controller considers orphaned.
+        """
+        key_map = await self._get_node_group_key_map(node_id)
+        referenced_ids = {e.groupKeySetID for e in key_map}
+        known = set(self._known_keysets_per_node.get(node_id, set()))
+        orphaned = known - referenced_ids - {0}
+        return {
+            "node_id": node_id,
+            "group_key_map": [
+                {"group_id": e.groupId, "keyset_id": e.groupKeySetID} for e in key_map
+            ],
+            "controller_tracked_keysets": sorted(known),
+            "inferred_orphaned_keysets": sorted(orphaned),
+            "group_key_store_entries": [
+                {"group_id": gid, "keyset_id": kid}
+                for gid, (kid, _) in self._group_key_store.items()
+            ],
+        }
 
     @staticmethod
     def _derive_group_encryption_key(
@@ -2125,6 +2204,13 @@ class MatterDeviceController:
                 )
             ),
             timed_request_timeout_ms=5000,
+        )
+        # Track that this keyset is now installed on the node so we can clean it up
+        # later even when the device does not support GroupKeyTable (e.g. Tapo).
+        tracked = self._known_keysets_per_node.setdefault(node_id, set())
+        tracked.add(keyset_id)
+        self.server.storage.set(
+            DATA_KEY_NODE_KEYSETS, sorted(tracked), subkey=str(node_id)
         )
 
     @api_command(APICommand.GROUP_BIND_KEY_SET)

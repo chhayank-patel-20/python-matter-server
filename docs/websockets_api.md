@@ -953,7 +953,7 @@ Sends `Groups.RemoveGroup` to the device, then automatically removes any keysets
 
 Sends `Groups.RemoveAllGroups` to the device, then automatically removes all orphaned keysets.
 
-> **Matter spec note:** `RemoveAllGroups` clears the group table but does **not** remove keysets. The server reads `GroupKeyTable`, computes which keyset IDs are no longer referenced by any group, and calls `KeySetRemove` for each one. After this call the node's keyset table is fully reclaimed.
+> **Matter spec note:** `RemoveAllGroups` clears the group table but does **not** remove keysets. The server tries to read `GroupKeyTable` to discover provisioned keysets; if the device does not expose it (e.g. Tapo), it falls back to the controller-side keyset tracker. It then calls `KeySetRemove` on every keyset no longer referenced by a group binding. After this call the node's keyset slots are fully reclaimed.
 
 ```json
 {
@@ -1090,6 +1090,47 @@ the encryption keys for that group ID.
 **Common Errors:**
 - `CHIP Error 0xAC (Internal Error)` — The controller lacks encryption keys for this group ID. Call `group_add` first to provision the controller and nodes. If keys were orphaned (e.g. after calling `init_group_testing_data`), the server automatically re-injects them and retries once.
 - `CHIP Error 0x32 (Timeout)` — A CASE session could not be established with a node (mDNS lookup failed or device is offline). This does not affect groupcast delivery to other online nodes.
+
+---
+
+**`group_debug_info`** — Raw group key state dump for a node
+
+Returns the device's live `GroupKeyMap`, the controller-tracked keysets for the node, and the controller's inferred list of orphaned keysets. Useful for diagnosing groupcast failures and keyset exhaustion on devices that do not expose `GroupKeyTable`.
+
+```json
+{
+  "message_id": "1",
+  "command": "group_debug_info",
+  "args": { "node_id": 1 }
+}
+```
+
+**Response:**
+```json
+{
+  "message_id": "1",
+  "result": {
+    "node_id": 1,
+    "group_key_map": [
+      { "group_id": 100, "keyset_id": 101 },
+      { "group_id": 200, "keyset_id": 101 }
+    ],
+    "controller_tracked_keysets": [101],
+    "inferred_orphaned_keysets": [],
+    "group_key_store_entries": [
+      { "group_id": 100, "keyset_id": 101 },
+      { "group_id": 200, "keyset_id": 101 }
+    ]
+  }
+}
+```
+
+| Field | Description |
+|---|---|
+| `group_key_map` | Live read of `GroupKeyManagement.GroupKeyMap` from the device |
+| `controller_tracked_keysets` | Keyset IDs the server has written to this node via `KeySetWrite` |
+| `inferred_orphaned_keysets` | `controller_tracked - referenced_by_map - {0}` — these will be removed on next cleanup |
+| `group_key_store_entries` | The server's crypto store — group→keyset mappings used for groupcast encryption |
 
 ---
 

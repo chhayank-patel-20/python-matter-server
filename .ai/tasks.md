@@ -31,6 +31,9 @@
 - [x] Fix keyset leak: `group_remove` and `group_remove_all` now call `_cleanup_unused_keysets_on_node` after removing groups (`RemoveGroup`/`RemoveAllGroups` do not remove keysets per the Matter spec).
 - [x] Add `_cleanup_unused_keysets_on_node`: reads `GroupKeyTable`, finds keyset IDs not referenced by `GroupKeyMap`, calls `KeySetRemove` on each. Returns number removed.
 - [x] Fix keyset ResourceExhausted in `_provision_group_keys_on_node`: on `ResourceExhausted` from `KeySetWrite`, run cleanup + retry before falling back to keyset reuse.
+- [x] Add controller-side keyset tracker (`_known_keysets_per_node`, persisted as `node_keysets`): records every `KeySetWrite` and confirmed keyset presence; used as fallback source for cleanup when device does not expose `GroupKeyTable` (e.g. Tapo).
+- [x] Fix `_cleanup_unused_keysets_on_node` fallback: if `GroupKeyTable` read fails/empty, use `_known_keysets_per_node` as the keyset source; update tracker on each `KeySetRemove`.
+- [x] Add `group_debug_info` API command: returns live `GroupKeyMap`, controller-tracked keysets, inferred orphaned keysets, and group key store entries for a node.
 
 ## Backlog
 - [ ] Add `discover` command to `scripts/cli_client.py`.

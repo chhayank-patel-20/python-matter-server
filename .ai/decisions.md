@@ -203,3 +203,17 @@ The previous TLV injection stored the raw epoch key as `TagKeyValue` (tag 6) and
 ### 3. `_cleanup_unused_keysets_on_node` reads `GroupKeyTable`, not server state
 - **Decision**: The cleanup helper reads `GroupKeyManagement.Attributes.GroupKeyTable` from the device to discover all provisioned keysets — it does NOT rely on `_group_key_store` as the source of truth for what's on the device.
 - **Rationale**: The server's `_group_key_store` only tracks crypto material for groups the server created. Keysets installed by other controllers (e.g. during multi-fabric commissioning) are invisible to the server's local store but would still be found via `GroupKeyTable`. This approach correctly handles all keysets regardless of origin.
+
+## 2026-03-26: Controller-Side Keyset Tracking
+
+### 1. `_known_keysets_per_node` as cleanup fallback
+- **Decision**: Maintain `_known_keysets_per_node: dict[int, set[int]]` — a controller-side record of every keyset ID written to each node. Persisted as `node_keysets` in server storage. Updated on every successful `KeySetWrite`, every confirmed keyset presence (skipped write, keyset reuse), and decremented on every `KeySetRemove`.
+- **Rationale**: Many consumer devices (e.g. Tapo P110) do not expose `GroupKeyManagement.Attributes.GroupKeyTable`. Without a fallback, `_cleanup_unused_keysets_on_node` would silently skip cleanup, causing permanent keyset leaks. The controller is the only entity that always knows which keysets it wrote, making it the correct authoritative source when device introspection is unavailable.
+
+### 2. `GroupKeyTable` first, controller tracker as fallback in cleanup
+- **Decision**: `_cleanup_unused_keysets_on_node` tries `GroupKeyTable` first. If the result is empty/unavailable, it falls back to `_known_keysets_per_node`. This ensures cleanup works on both spec-compliant and partial implementations.
+- **Rationale**: Prefer device-side truth when available (more accurate if another controller also writes keysets). Only fall back to controller tracking when the device can't provide it.
+
+### 3. `group_debug_info` command
+- **Decision**: Added `group_debug_info(node_id)` API command returning `{group_key_map, controller_tracked_keysets, inferred_orphaned_keysets, group_key_store_entries}`. All data is derived from live device reads + server state — no extra storage.
+- **Rationale**: Groupcast failures on consumer devices are hard to diagnose without visibility into the device's key map vs the controller's state. This command gives the frontend (and developers) a single-call dump of all relevant group key state.

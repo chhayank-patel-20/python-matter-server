@@ -68,6 +68,7 @@ class APICommand(StrEnum):
     GROUP_SEND_COMMAND = "group_send_command"
     GROUP_ADD_KEY_SET = "group_add_key_set"
     GROUP_BIND_KEY_SET = "group_bind_key_set"
+    GROUP_DEBUG_INFO = "group_debug_info"
     INIT_GROUP_TESTING_DATA = "init_group_testing_data"
     SCAN_BLE_DEVICES = "scan_ble_devices"
     COMMISSION_WITH_MAC = "commission_with_mac"
