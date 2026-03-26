@@ -171,3 +171,21 @@ The previous TLV injection stored the raw epoch key as `TagKeyValue` (tag 6) and
 ### 3. New helpers: `_get_node_group_key_map`, `_provision_group_keys_on_node`, `_is_resource_exhausted_err`
 - **Decision**: Extracted provisioning logic into a dedicated `_provision_group_keys_on_node` coroutine called by `group_add`. Reading the device state is always done via `_get_node_group_key_map`. Error classification is handled by the static `_is_resource_exhausted_err`.
 - **Rationale**: Keeps `group_add` clean and readable; makes the provisioning algorithm independently testable.
+
+## 2026-03-26: group_list, group_remove_all, and group-table Exhaustion Fix
+
+### 1. Add `group_list` command
+- **Decision**: New `group_list` API command that calls `Groups.GetGroupMembership(groupList=[])` for IDs and remaining capacity, then calls `Groups.ViewGroup` per group ID to get the name. Returns `GroupListResult` with `node_id`, `endpoint`, `remaining_capacity`, and `groups: list[MatterGroupInfo]`.
+- **Rationale**: The UI had no way to display existing groups or know how many slots remain. `GetGroupMembership` alone gives only IDs; `ViewGroup` is required for names. Fetching both in one command gives the frontend everything it needs.
+
+### 2. Add `group_remove_all` command
+- **Decision**: New `group_remove_all` API command that sends `Groups.RemoveAllGroups()` to the specified endpoint.
+- **Rationale**: When a device's group table is full and the user wants a clean slate (e.g. after a keyset table exhaustion error), there was no single-call way to clear all groups. `RemoveAllGroups` is part of the Matter Groups cluster spec (§11.2.7.4) and is the correct mechanism.
+
+### 3. FIFO group eviction in `group_add` when table is full
+- **Decision**: Before calling `AddGroup`, `group_add` now calls `_get_group_membership_and_capacity` (wraps `GetGroupMembership`). If `remaining_capacity == 0` and the target group is not already a member, the **first group in the returned list is removed** (FIFO) to free a slot.
+- **Rationale**: Devices have a fixed group table size (e.g. 4 entries). Without a capacity check, `AddGroup` would succeed on the node level only to fail during key provisioning or vice versa, leaving the device in an inconsistent state. FIFO eviction is a simple, predictable strategy; the UI can call `group_list` first if it wants to choose which group to remove manually.
+
+### 4. New dataclasses: `MatterGroupInfo` and `GroupListResult`
+- **Decision**: Added to `matter_server/common/models.py`. `MatterGroupInfo(group_id, group_name)` and `GroupListResult(node_id, endpoint, remaining_capacity, groups)`.
+- **Rationale**: Typed response objects keep the API contract explicit and make serialization via the existing JSON helpers automatic.
