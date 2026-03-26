@@ -28,6 +28,9 @@
 - [x] Add `group_list` API command: calls `GetGroupMembership` + `ViewGroup` per group, returns `GroupListResult` with `remaining_capacity` and list of `{group_id, group_name}`. Live query — no server cache.
 - [x] Add `group_remove_all` API command: sends `Groups.RemoveAllGroups` to the device endpoint.
 - [x] Fix `group_add` group-table exhaustion: calls `GetGroupMembership` first; if `remaining_capacity == 0` and group not already a member, FIFO-evicts the oldest group before calling `AddGroup`.
+- [x] Fix keyset leak: `group_remove` and `group_remove_all` now call `_cleanup_unused_keysets_on_node` after removing groups (`RemoveGroup`/`RemoveAllGroups` do not remove keysets per the Matter spec).
+- [x] Add `_cleanup_unused_keysets_on_node`: reads `GroupKeyTable`, finds keyset IDs not referenced by `GroupKeyMap`, calls `KeySetRemove` on each. Returns number removed.
+- [x] Fix keyset ResourceExhausted in `_provision_group_keys_on_node`: on `ResourceExhausted` from `KeySetWrite`, run cleanup + retry before falling back to keyset reuse.
 
 ## Backlog
 - [ ] Add `discover` command to `scripts/cli_client.py`.

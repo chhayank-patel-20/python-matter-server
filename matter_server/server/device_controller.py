@@ -1537,6 +1537,80 @@ class MatterDeviceController:
         remaining: int | None = raw_cap if isinstance(raw_cap, int) else None
         return group_ids, remaining
 
+    async def _cleanup_unused_keysets_on_node(self, node_id: int) -> int:
+        """Remove keysets on node that are no longer referenced by any group.
+
+        Matter rule: RemoveAllGroups / RemoveGroup clear the group table but do NOT
+        remove keysets.  Orphaned keysets accumulate and eventually fill the device's
+        fixed-size keyset table (typically 3 slots), causing ResourceExhausted on the
+        next KeySetWrite.
+
+        Algorithm:
+          1. Read GroupKeyTable (all provisioned keysets, fabric-scoped).
+          2. Read GroupKeyMap  (all group→keyset bindings, fabric-scoped).
+          3. Any keyset in GroupKeyTable that is NOT referenced by GroupKeyMap
+             (and is NOT the IPK, keyset_id=0) is orphaned → remove via KeySetRemove.
+
+        Returns the number of keysets successfully removed.
+        """
+        # 1. Read all provisioned keysets from the device.
+        try:
+            table_result = await self._chip_device_controller.read_attribute(
+                node_id=node_id,
+                attributes=[
+                    (0, Clusters.GroupKeyManagement.Attributes.GroupKeyTable)  # pylint: disable=no-member
+                ],
+            )
+            if table_result is None or table_result.attributes is None:
+                return 0
+            all_keyset_ids: set[int] = {
+                entry.groupKeySetID
+                for entry in table_result.attributes[0][Clusters.GroupKeyManagement][
+                    Clusters.GroupKeyManagement.Attributes.GroupKeyTable  # pylint: disable=no-member
+                ]
+            }
+        except Exception:  # noqa: BLE001  # pylint: disable=W0718
+            LOGGER.debug(
+                "Could not read GroupKeyTable from node %s — skipping keyset cleanup",
+                node_id,
+            )
+            return 0
+
+        if not all_keyset_ids:
+            return 0
+
+        # 2. Find which keysets are still referenced by a group binding.
+        entries = await self._get_node_group_key_map(node_id)
+        referenced_ids: set[int] = {e.groupKeySetID for e in entries}
+
+        # 3. Orphaned = provisioned but not referenced; never remove IPK (id=0).
+        orphaned = all_keyset_ids - referenced_ids - {0}
+        if not orphaned:
+            return 0
+
+        removed = 0
+        for kid in orphaned:
+            try:
+                await self._chip_device_controller.send_command(
+                    node_id,
+                    0,  # GroupKeyManagement is always on endpoint 0
+                    Clusters.GroupKeyManagement.Commands.KeySetRemove(
+                        groupKeySetID=kid
+                    ),
+                    timed_request_timeout_ms=5000,
+                )
+                removed += 1
+                LOGGER.info("Removed orphaned keyset %s from node %s", kid, node_id)
+            except Exception:  # noqa: BLE001  # pylint: disable=W0718
+                LOGGER.warning(
+                    "Failed to remove keyset %s from node %s",
+                    kid,
+                    node_id,
+                    exc_info=True,
+                )
+
+        return removed
+
     async def _get_node_group_key_map(
         self, node_id: int
     ) -> list[Clusters.GroupKeyManagement.Structs.GroupKeyMapStruct]:
@@ -1563,7 +1637,7 @@ class MatterDeviceController:
         except (KeyError, TypeError):
             return []
 
-    async def _provision_group_keys_on_node(
+    async def _provision_group_keys_on_node(  # pylint: disable=too-many-locals
         self,
         node_id: int,
         group_id: int,
@@ -1579,11 +1653,12 @@ class MatterDeviceController:
         3. If keyset_id already appears in any mapping on the device → the keyset is
            already installed; skip KeySetWrite and only update the GroupKeyMap entry.
         4. Otherwise write the keyset via KeySetWrite, then update GroupKeyMap.
-        5. On ResourceExhausted (0x89): the device keyset table is full.  Find a
-           keyset that is (a) already on the device and (b) known to the server
-           (i.e. in _group_key_store).  Update both the device GroupKeyMap and our
-           local key store to use that reused keyset.  Raises InvalidArguments if
-           no reusable keyset can be found.
+        5. On ResourceExhausted (0x89):
+           a. Run _cleanup_unused_keysets_on_node to remove orphaned keysets.
+           b. Re-read device state and retry KeySetWrite if any slot was freed.
+           c. If still full, find a keyset that is (a) already on the device and
+              (b) known to the server.  Reuse it.  Raises InvalidArguments if
+              no reusable keyset can be found.
         """
         # 1. Read current device GroupKeyMap.
         entries = await self._get_node_group_key_map(node_id)
@@ -1607,14 +1682,35 @@ class MatterDeviceController:
         actual_epoch_key_hex = epoch_key_hex
 
         if keyset_id not in device_keyset_ids:
+            write_error: InteractionModelError | None = None
             try:
                 await self.group_add_key_set(node_id, keyset_id, epoch_key_hex)
             except InteractionModelError as err:
                 if not self._is_resource_exhausted_err(err):
                     raise
+                write_error = err
 
-                # 5. ResourceExhausted — device keyset table is full.
-                # Build {keyset_id: epoch_key_hex} for every keyset we know about.
+            if write_error is not None:
+                # 5a. ResourceExhausted — try removing orphaned keysets first.
+                cleaned = await self._cleanup_unused_keysets_on_node(node_id)
+                if cleaned > 0:
+                    # Slots freed — retry the write.
+                    try:
+                        await self.group_add_key_set(node_id, keyset_id, epoch_key_hex)
+                        write_error = None  # retry succeeded
+                    except InteractionModelError as retry_err:
+                        if not self._is_resource_exhausted_err(retry_err):
+                            raise
+                        write_error = retry_err
+
+            if write_error is not None:
+                # 5b. Still full after cleanup — re-read state (may have changed
+                #     during cleanup) and fall back to reusing a server-managed
+                #     keyset that is already installed on the device.
+                entries = await self._get_node_group_key_map(node_id)
+                existing_bindings = {e.groupId: e.groupKeySetID for e in entries}
+                device_keyset_ids = set(existing_bindings.values())
+
                 our_keyset_map: dict[int, str] = dict(self._group_key_store.values())
                 reusable = set(our_keyset_map.keys()) & device_keyset_ids
                 if not reusable:
@@ -1623,7 +1719,7 @@ class MatterDeviceController:
                         "device keyset table is full and no server-managed keyset "
                         "is installed on this device. Remove unused group memberships "
                         "or keysets on the device before adding more groups."
-                    ) from err
+                    ) from write_error
 
                 # Pick the lowest reusable keyset_id (stable, deterministic).
                 actual_keyset_id = min(reusable)
@@ -1691,21 +1787,34 @@ class MatterDeviceController:
 
     @api_command(APICommand.GROUP_REMOVE)
     async def group_remove(self, node_id: int, endpoint: int, group_id: int) -> None:
-        """Remove node from a group."""
+        """Remove node from a group, then clean up any orphaned keysets.
+
+        Matter note: RemoveGroup removes the group membership entry but does NOT
+        remove the associated keyset.  We call _cleanup_unused_keysets_on_node
+        afterward so keyset slots are reclaimed for future use.
+        """
         await self._chip_device_controller.send_command(
             node_id,
             endpoint,
             Clusters.Groups.Commands.RemoveGroup(groupID=group_id),
         )
+        await self._cleanup_unused_keysets_on_node(node_id)
 
     @api_command(APICommand.GROUP_REMOVE_ALL)
     async def group_remove_all(self, node_id: int, endpoint: int) -> None:
-        """Remove all groups from a node endpoint."""
+        """Remove all groups from a node endpoint, then clean up all orphaned keysets.
+
+        Matter note: RemoveAllGroups clears the group table but does NOT remove
+        keysets.  Without the cleanup step, repeated add/remove cycles would fill
+        the device's fixed keyset table (typically 3 slots) and cause
+        ResourceExhausted on the next group_add.
+        """
         await self._chip_device_controller.send_command(
             node_id,
             endpoint,
             Clusters.Groups.Commands.RemoveAllGroups(),
         )
+        await self._cleanup_unused_keysets_on_node(node_id)
 
     @api_command(APICommand.GROUP_LIST)
     async def group_list(self, node_id: int, endpoint: int) -> GroupListResult:

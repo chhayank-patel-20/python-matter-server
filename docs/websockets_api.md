@@ -909,11 +909,13 @@ on the device — not on the server.
 **Errors:**
 - `InvalidArguments` — endpoint does not support the Groups cluster
 - `InvalidArguments` — group table is reported full but `GetGroupMembership` returned no existing groups (device in unexpected state)
-- `InvalidArguments` — device keyset table is full **and** no server-managed keyset is already installed on the device; use `group_remove` or `group_remove_all` to free slots first
+- `InvalidArguments` — device keyset table is full even after orphan cleanup and no server-managed keyset is already installed on the device; call `group_remove` or `group_remove_all` (which also clean up keysets) then retry
 
-> **Automatic FIFO eviction:** If `GetGroupMembership` reports `remaining_capacity == 0`, `group_add` automatically removes the oldest group on that endpoint (the first entry in the membership list) before adding the new one. Use `group_list` first if you want to choose which group to remove manually.
+> **Automatic FIFO eviction:** If `GetGroupMembership` reports `remaining_capacity == 0`, `group_add` automatically removes the oldest group on that endpoint before adding the new one. Use `group_list` first if you want to choose which group to remove manually.
 >
-> **Keyset reuse:** Devices typically support only 3 group keysets. `group_add` reuses existing keysets across multiple groups, so you can manage more groups than the keyset limit allows.
+> **Automatic keyset cleanup on ResourceExhausted:** If `KeySetWrite` fails with `ResourceExhausted`, the server immediately calls `KeySetRemove` on all orphaned keysets (those in `GroupKeyTable` but no longer referenced by any group binding) and retries before falling back to keyset reuse.
+>
+> **Keyset reuse:** Devices typically support only 3 group keysets. `group_add` reuses existing keysets across multiple groups so you can manage more groups than the keyset limit.
 
 **Typical workflow:**
 ```
@@ -927,7 +929,9 @@ group_add(node_id=3, endpoint=1, group_id=100, group_name="Lights")
 
 **`group_remove`** — Remove a node endpoint from a group
 
-Sends `Groups.RemoveGroup` to the device endpoint.
+Sends `Groups.RemoveGroup` to the device, then automatically removes any keysets that are no longer referenced by any group on that node.
+
+> **Matter spec note:** `RemoveGroup` clears the group membership entry but does **not** remove the associated keyset. Without the cleanup step, repeated add/remove cycles would gradually fill the device's keyset table (typically 3 slots) and cause `ResourceExhausted` on the next `group_add`.
 
 ```json
 {
@@ -947,7 +951,9 @@ Sends `Groups.RemoveGroup` to the device endpoint.
 
 **`group_remove_all`** — Remove all groups from a node endpoint
 
-Sends `Groups.RemoveAllGroups` to the device endpoint. Useful for clearing a full group table before re-adding groups.
+Sends `Groups.RemoveAllGroups` to the device, then automatically removes all orphaned keysets.
+
+> **Matter spec note:** `RemoveAllGroups` clears the group table but does **not** remove keysets. The server reads `GroupKeyTable`, computes which keyset IDs are no longer referenced by any group, and calls `KeySetRemove` for each one. After this call the node's keyset table is fully reclaimed.
 
 ```json
 {

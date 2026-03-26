@@ -189,3 +189,17 @@ The previous TLV injection stored the raw epoch key as `TagKeyValue` (tag 6) and
 ### 4. New dataclasses: `MatterGroupInfo` and `GroupListResult`
 - **Decision**: Added to `matter_server/common/models.py`. `MatterGroupInfo(group_id, group_name)` and `GroupListResult(node_id, endpoint, remaining_capacity, groups)`.
 - **Rationale**: Typed response objects keep the API contract explicit and make serialization via the existing JSON helpers automatic.
+
+## 2026-03-26: Keyset Lifecycle Management (Fix Keyset Leak)
+
+### 1. `RemoveGroup`/`RemoveAllGroups` do NOT remove keysets (Matter spec)
+- **Decision**: After every `group_remove` and `group_remove_all` call, immediately invoke `_cleanup_unused_keysets_on_node`, which reads `GroupKeyTable`, diffs against `GroupKeyMap` (active bindings), and calls `KeySetRemove` on every orphaned keyset (excluding IPK id=0).
+- **Rationale**: This is a Matter spec constraint: the Groups cluster `RemoveGroup`/`RemoveAllGroups` commands only clear the group membership table. The keyset table (managed by Group Key Management cluster) is completely separate and must be cleaned manually. Without this, repeated add/remove cycles fill the 3-slot keyset table, causing `ResourceExhausted` on every subsequent `KeySetWrite`.
+
+### 2. Cleanup-then-retry on ResourceExhausted in `_provision_group_keys_on_node`
+- **Decision**: When `KeySetWrite` returns `ResourceExhausted`, the code now: (a) calls `_cleanup_unused_keysets_on_node`, (b) retries `KeySetWrite` if any slots were freed, (c) only falls back to keyset reuse if cleanup freed nothing or the retry still fails.
+- **Rationale**: Previous behavior jumped straight to keyset reuse, which shares encryption keys across groups (weaker isolation). Cleanup-first gives the device a fresh slot and keeps each group on its own keyset when possible.
+
+### 3. `_cleanup_unused_keysets_on_node` reads `GroupKeyTable`, not server state
+- **Decision**: The cleanup helper reads `GroupKeyManagement.Attributes.GroupKeyTable` from the device to discover all provisioned keysets — it does NOT rely on `_group_key_store` as the source of truth for what's on the device.
+- **Rationale**: The server's `_group_key_store` only tracks crypto material for groups the server created. Keysets installed by other controllers (e.g. during multi-fabric commissioning) are invisible to the server's local store but would still be found via `GroupKeyTable`. This approach correctly handles all keysets regardless of origin.
