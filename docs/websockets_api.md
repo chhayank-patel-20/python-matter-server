@@ -864,7 +864,13 @@ Common attribute paths:
 
 Groups in Matter are managed entirely on the **device** — the server does not maintain a
 group registry. Group membership is stored on each endpoint via the Groups cluster and
-is queried directly from the device with `group_get_membership`.
+is queried directly from the device with `group_list` or `group_get_membership`.
+
+**Server-side state (what the server does persist):**
+- `group_keys` — one entry per group ID: the epoch key and keyset ID used to encrypt groupcast frames. Required so the controller can send multicast after a restart without re-running `group_add` on every node.
+- `node_keysets` — per-node set of keyset IDs the server has explicitly written via `KeySetWrite`. Used as a fallback source for keyset cleanup on devices that do not expose `GroupKeyManagement.Attributes.GroupKeyTable` (e.g. Tapo).
+
+Everything else (group membership, group names, keyset bindings) lives on the device.
 
 ---
 
@@ -913,7 +919,7 @@ on the device — not on the server.
 
 > **Automatic FIFO eviction:** If `GetGroupMembership` reports `remaining_capacity == 0`, `group_add` automatically removes the oldest group on that endpoint before adding the new one. Use `group_list` first if you want to choose which group to remove manually.
 >
-> **Automatic keyset cleanup on ResourceExhausted:** If `KeySetWrite` fails with `ResourceExhausted`, the server immediately calls `KeySetRemove` on all orphaned keysets (those in `GroupKeyTable` but no longer referenced by any group binding) and retries before falling back to keyset reuse.
+> **Automatic keyset cleanup on ResourceExhausted:** If `KeySetWrite` fails with `ResourceExhausted`, the server calls `KeySetRemove` on all orphaned keysets and retries before falling back to keyset reuse. Orphaned keysets are discovered via `GroupKeyTable` if the device exposes it; otherwise the server falls back to its own `node_keysets` tracker.
 >
 > **Keyset reuse:** Devices typically support only 3 group keysets. `group_add` reuses existing keysets across multiple groups so you can manage more groups than the keyset limit.
 
@@ -931,7 +937,7 @@ group_add(node_id=3, endpoint=1, group_id=100, group_name="Lights")
 
 Sends `Groups.RemoveGroup` to the device, then automatically removes any keysets that are no longer referenced by any group on that node.
 
-> **Matter spec note:** `RemoveGroup` clears the group membership entry but does **not** remove the associated keyset. Without the cleanup step, repeated add/remove cycles would gradually fill the device's keyset table (typically 3 slots) and cause `ResourceExhausted` on the next `group_add`.
+> **Matter spec note:** `RemoveGroup` clears the group membership entry but does **not** remove the associated keyset. The server calls `KeySetRemove` on any keyset that is no longer referenced by a group binding. Orphaned keysets are discovered via `GroupKeyTable` first; if unavailable, the server falls back to its `node_keysets` tracker.
 
 ```json
 {
