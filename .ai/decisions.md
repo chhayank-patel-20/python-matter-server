@@ -25,19 +25,25 @@
 - **Decision**: Added internal storage for the last provided WiFi and Thread credentials in `MatterDeviceController`.
 - **Rationale**: Matter devices being commissioned over BLE need network credentials to join the local network. By storing these credentials when they are set via the API, we can automatically provide them to the SDK during the `commission_ble` process, resolving "Required network information not provided" errors.
 
-## 2026-03-23: Group Management APIs and Automatic Group Key Initialization
+## 2026-03-26: Spec-Compliant Group Management Refactor
 
-### 1. Add Server-side Group Registry
-- **Decision**: Added `get_groups`, `add_group`, and `remove_group` API commands and a persistent group registry in `MatterDeviceController`.
-- **Rationale**: Users need a centralized way to manage Matter groups at the server level, rather than just querying distributed node membership. This registry stores `group_id` and `group_name` mapping.
+### 1. Remove Server-side Group Registry
+- **Decision**: Removed `get_groups`, `add_group`, `remove_group` API commands and the `_groups` dict / `MatterGroupInfo` model. Replaced with a minimal `_group_key_store` (group_id → keyset_id + epoch_key_hex) persisted under `DATA_KEY_GROUP_KEYS`.
+- **Rationale**: Matter specifies that group membership is owned by the device (Groups cluster on each endpoint). The server-side registry created state divergence and violated the spec. Devices are now the source of truth; `group_get_membership` reads directly from the device.
 
-### 2. Automatic Initialization of Group Testing Data
-- **Decision**: Added an automatic call to `init_group_testing_data` in `MatterDeviceController.start()`.
-- **Rationale**: Fixes `CHIP Error 0x000000AC: Internal error` when sending group commands. This error occurs if the controller's group data provider hasn't been initialized with keys. By doing this automatically at startup, we provide a "works out of the box" experience for group commands in development/testing environments.
+### 2. Remove Automatic init_group_testing_data at Startup
+- **Decision**: Removed the automatic `init_group_testing_data()` call from `MatterDeviceController.start()`. It is now only available as an explicit API command for testing.
+- **Rationale**: This call rewrites the controller's FabricData linked list, orphaning any custom group keys. Custom groups survive restarts because chip.json already contains the correct entries from the initial `_inject_controller_group_keys` call; re-injection is not needed.
 
-### 3. Sync node group membership with server registry
-- **Decision**: Updated `group_add` to automatically add a group to the server-side registry if it doesn't already exist.
-- **Rationale**: Ensures consistency between what's configured on nodes and what's known to the server.
+### 3. Descriptor Cluster Validation in group_add
+- **Decision**: `group_add` now reads `Descriptor.ServerList` for the target endpoint and raises `InvalidArguments` if cluster ID 4 (Groups) is not present.
+- **Rationale**: Follows Matter spec requirement to verify endpoint capability before issuing cluster commands. Prevents silent failures on endpoints that don't support the Groups cluster.
+
+### 4. Simplified Controller Key Injection (_inject_controller_group_keys)
+- **Decision**: Replaced `_ensure_controller_group_keys` (which also wrote GroupInfo entries) and `_overwrite_controller_keyset` (migration for old buggy keys) with a single `_inject_controller_group_keys(group_id, keyset_id, epoch_key_hex)`.
+- **Rationale**: GroupInfo entries in the controller KVS are NOT required for `SendGroupCommand` (which traverses only the KeyMap→KeySet path). Removing GroupInfo writing significantly simplifies TLV injection. The migration helpers are no longer needed since the new code always writes correct HKDF-derived keys on first use.
+
+## 2026-03-23: Group Management APIs (superseded by 2026-03-26 refactor)
 
 ## 2026-03-23: Robust Group Management and 0xAC Error Handling
 

@@ -1,16 +1,20 @@
-# Websocket documentation
+# WebSocket API Documentation
 
-This document describes the Websocket API for the Python Matter Server.
+This document describes the WebSocket API for the Python Matter Server.
 
-## Websocket connection
+---
 
-When a client connects to the Matter Server, it will automatically receive a `server_info` message with version information.
+## Connection
+
+When a client connects, the server immediately pushes a `server_info` message (no command needed).
+
+**Server Info message (pushed on connect):**
 
 ```json
 {
   "fabric_id": 1,
-  "compressed_fabric_id": 1234567890,
-  "schema_version": 1,
+  "compressed_fabric_id": 3735928559,
+  "schema_version": 6,
   "min_supported_schema_version": 1,
   "sdk_version": "1.0.0",
   "wifi_credentials_set": true,
@@ -19,59 +23,144 @@ When a client connects to the Matter Server, it will automatically receive a `se
 }
 ```
 
-## Websocket commands
+| Field | Type | Description |
+|---|---|---|
+| `fabric_id` | int | Fabric ID of this controller |
+| `compressed_fabric_id` | int | Compressed fabric ID (64-bit) |
+| `schema_version` | int | Current API schema version |
+| `min_supported_schema_version` | int | Minimum schema version this server accepts |
+| `sdk_version` | str | Matter SDK version string |
+| `wifi_credentials_set` | bool | Whether WiFi credentials have been configured |
+| `thread_credentials_set` | bool | Whether Thread credentials have been configured |
+| `bluetooth_enabled` | bool | Whether BLE is available on this host |
+
+---
+
+## Message Format
+
+All commands follow this structure:
+
+```json
+{
+  "message_id": "unique-string",
+  "command": "command_name",
+  "args": {}
+}
+```
+
+All responses follow this structure:
+
+```json
+{
+  "message_id": "unique-string",
+  "result": null
+}
+```
+
+On error, the response is:
+
+```json
+{
+  "message_id": "unique-string",
+  "error_code": "InvalidArguments",
+  "details": "Human-readable error description"
+}
+```
+
+---
+
+## Commands
 
 ### Server Information
 
-**Get Server Info**
+---
 
-Get version info of the Matter Server.
+**`server_info`** — Get server version and status
 
+```json
+{ "message_id": "1", "command": "server_info" }
+```
+
+**Response:**
 ```json
 {
   "message_id": "1",
-  "command": "server_info"
+  "result": {
+    "fabric_id": 1,
+    "compressed_fabric_id": 3735928559,
+    "schema_version": 6,
+    "min_supported_schema_version": 1,
+    "sdk_version": "1.0.0",
+    "wifi_credentials_set": true,
+    "thread_credentials_set": false,
+    "bluetooth_enabled": true
+  }
 }
 ```
 
-**Get Server Diagnostics**
+---
 
-Return a full dump of the server (for diagnostics).
+**`diagnostics`** — Full server dump for debugging
 
+Returns the server info, all commissioned nodes, and the last 25 server-side events.
+
+```json
+{ "message_id": "1", "command": "diagnostics" }
+```
+
+**Response:**
 ```json
 {
   "message_id": "1",
-  "command": "diagnostics"
+  "result": {
+    "info": { "fabric_id": 1, "...": "..." },
+    "nodes": [ { "node_id": 1, "available": true, "...": "..." } ],
+    "events": []
+  }
 }
 ```
 
-**Get Vendor Names**
+---
 
-Get a map of vendor ids to vendor names.
+**`get_vendor_names`** — Resolve vendor IDs to vendor names
+
+Fetches from the CSA vendor database. Use `filter_vendors` to limit the lookup.
 
 ```json
 {
   "message_id": "1",
   "command": "get_vendor_names",
   "args": {
-    "filter_vendors": [1, 2, 3]
+    "filter_vendors": [4937, 4151]
   }
 }
 ```
 
+**Response:**
+```json
+{
+  "message_id": "1",
+  "result": {
+    "4937": "TP-Link",
+    "4151": "Tapo"
+  }
+}
+```
+
+---
+
 ### Commissioning
 
-**Scan BLE Devices**
+---
 
-Scan for nearby BLE devices and return raw advertisement data. Optionally filter by MAC address.
-Use `timeout` of 20-30 seconds for reliable discovery (devices advertise periodically).
+**`scan_ble_devices`** — Scan for nearby BLE devices
 
-> **Why does my device show different data each time?**
-> A Matter device only includes the Matter service UUID `0000fff6-0000-1000-8000-00805f9b34fb`
-> in its advertisement when a **commissioning window is open** (triggered by a button press or
-> factory reset). When `is_matter` is `false`, the device is not ready to be paired — open a
-> commissioning window on the device first. When `is_matter` is `true`, the `matter_discriminator`
-> is extracted automatically and can be used by `commission_with_mac`.
+Returns raw advertisement data for all nearby BLE devices. Optionally filter by MAC address.
+Use a `timeout` of 20–30 seconds for reliable results (devices advertise periodically).
+
+> A Matter device only includes UUID `0000fff6-0000-1000-8000-00805f9b34fb` in its advertisement
+> when a **commissioning window is open** (button press or factory reset). When `is_matter` is
+> `false`, the device cannot be commissioned — open the commissioning window first.
 
 ```json
 {
@@ -84,10 +173,12 @@ Use `timeout` of 20-30 seconds for reliable discovery (devices advertise periodi
 }
 ```
 
-Omit `mac_address` to return all nearby BLE devices.
+| Arg | Required | Default | Description |
+|---|---|---|---|
+| `mac_address` | No | `null` | Filter to a specific MAC. Omit to return all devices. |
+| `timeout` | No | `10.0` | Scan duration in seconds. Use 20–30 for reliability. |
 
-**Example Response (device in commissioning mode):**
-
+**Response (device in commissioning mode):**
 ```json
 {
   "message_id": "1",
@@ -113,8 +204,7 @@ Omit `mac_address` to return all nearby BLE devices.
 }
 ```
 
-**Example Response (device NOT in commissioning mode):**
-
+**Response (device NOT in commissioning mode):**
 ```json
 {
   "message_id": "1",
@@ -137,16 +227,111 @@ Omit `mac_address` to return all nearby BLE devices.
 
 ---
 
-**Commission with MAC Address**
+**`set_wifi_credentials`** — Set WiFi credentials for commissioning
 
-Commission a Matter device using its BLE MAC address and setup PIN code — no QR code needed.
-The server scans for the device, extracts the discriminator from its Matter BLE advertisement,
-and commissions it using any pre-set WiFi/Thread credentials.
+Must be called before commissioning a WiFi-based device.
+
+```json
+{
+  "message_id": "1",
+  "command": "set_wifi_credentials",
+  "args": {
+    "ssid": "MyNetwork",
+    "credentials": "MyPassword"
+  }
+}
+```
+
+**Response:** `{ "message_id": "1", "result": null }`
+
+---
+
+**`set_thread_dataset`** — Set Thread operational dataset for commissioning
+
+Must be called before commissioning a Thread-based device.
+
+```json
+{
+  "message_id": "1",
+  "command": "set_thread_dataset",
+  "args": {
+    "dataset": "0e080000000000010000000300001235..."
+  }
+}
+```
+
+**Response:** `{ "message_id": "1", "result": null }`
+
+---
+
+**`set_default_fabric_label`** — Set a default fabric label applied after every commissioning
+
+```json
+{
+  "message_id": "1",
+  "command": "set_default_fabric_label",
+  "args": {
+    "label": "MyHome"
+  }
+}
+```
+
+**Response:** `{ "message_id": "1", "result": null }`
+
+---
+
+**`commission_with_code`** — Commission a device using a QR or manual pairing code
+
+Supports both QR-code syntax (`MT:...`) and 11-digit manual pairing codes.
+
+For WiFi or Thread devices, set credentials first with `set_wifi_credentials` or
+`set_thread_dataset`. The server automatically uses the BLE commissioning path when
+a discriminator can be extracted from the setup code.
+
+```json
+{
+  "message_id": "2",
+  "command": "commission_with_code",
+  "args": {
+    "code": "MT:Y.ABCDEFG123456789",
+    "fabric_label": "MyServer"
+  }
+}
+```
+
+| Arg | Required | Description |
+|---|---|---|
+| `code` | Yes | QR code (`MT:...`) or 11-digit manual pairing code |
+| `fabric_label` | No | Label stored on the device for this fabric (visible in `get_fabrics`) |
+
+**Response:** Full `MatterNodeData` of the newly commissioned node.
+
+```json
+{
+  "message_id": "2",
+  "result": {
+    "node_id": 3,
+    "date_commissioned": "2026-03-26T10:00:00",
+    "last_interview": "2026-03-26T10:00:05",
+    "interview_version": 1,
+    "available": true,
+    "is_bridge": false,
+    "attributes": { "0/40/3": "Tapo", "1/6/0": false }
+  }
+}
+```
+
+---
+
+**`commission_with_mac`** — Commission a device by BLE MAC address and PIN code
+
+No QR code needed. The server scans for the device by MAC, extracts the discriminator
+from the Matter BLE advertisement (`fff6` service data), and commissions using any
+pre-set WiFi/Thread credentials.
 
 **Requirements:**
-- Device must be in commissioning mode (`is_matter: true` in scan results)
-- Set WiFi credentials first via `set_wifi_credentials` (for WiFi devices)
-- Set Thread dataset first via `set_thread_dataset` (for Thread devices)
+- Device must be in commissioning mode (`is_matter: true` in `scan_ble_devices`)
+- WiFi/Thread credentials must be set beforehand
 
 ```json
 {
@@ -160,135 +345,27 @@ and commissions it using any pre-set WiFi/Thread credentials.
 }
 ```
 
-Returns the commissioned `MatterNodeData` on success. Raises an error if:
-- The device is not found in range
-- The device is not in Matter commissioning mode (no `fff6` UUID)
-- BLE commissioning itself fails
+| Arg | Required | Default | Description |
+|---|---|---|---|
+| `mac_address` | Yes | — | BLE MAC address of the device |
+| `setup_pin_code` | Yes | — | Setup PIN code from device label |
+| `scan_timeout` | No | `10.0` | BLE scan duration in seconds |
+
+**Response:** Full `MatterNodeData` of the commissioned node (same shape as `commission_with_code`).
+
+**Errors:**
+- Device not found in BLE range
+- Device is not in commissioning mode (no `fff6` UUID — open commissioning window first)
+- BLE commissioning failure
 
 **Typical workflow:**
-1. `scan_ble_devices` → confirm `is_matter: true` (press button if false)
-2. `set_wifi_credentials` → provide network credentials
-3. `commission_with_mac` → device is commissioned and returned as a node
+1. `scan_ble_devices` → confirm `is_matter: true`
+2. `set_wifi_credentials` → set network password
+3. `commission_with_mac` → device commissioned and returned
 
 ---
 
-**Discover**
-
-Discover Commissionable Nodes (discovered on BLE or mDNS). Returns the current list. New discoveries will be sent as `discovery_updated` events.
-
-```json
-{
-  "message_id": "1",
-  "command": "discover_commissionable_nodes"
-}
-```
-
-**Example Response:**
-
-```json
-{
-  "message_id": "1",
-  "result": [
-    {
-      "instance_name": "...",
-      "host_name": "...",
-      "port": 5540,
-      "long_discriminator": 1234,
-      "vendor_id": 1,
-      "product_id": 1,
-      "commissioning_mode": 1,
-      "device_type": 1,
-      "device_name": "My Device",
-      "pairing_instruction": "...",
-      "pairing_hint": 1,
-      "addresses": ["192.168.1.100"]
-    }
-  ]
-}
-```
-
-If the command fails due to internal errors (e.g. `object list can't be used in 'await' expression`), it will return an ErrorResultMessage.
-
-**Set WiFi credentials**
-
-Inform the controller about the WiFi credentials it needs to send when commissioning a new device.
-
-```json
-{
-  "message_id": "1",
-  "command": "set_wifi_credentials",
-  "args": {
-    "ssid": "wifi-name-here",
-    "credentials": "wifi-password-here"
-  }
-}
-```
-
-**Set Thread dataset**
-
-Inform the controller about the Thread credentials it needs to use when commissioning a new device.
-
-```json
-{
-  "message_id": "1",
-  "command": "set_thread_dataset",
-  "args": {
-    "dataset": "put-credentials-here"
-  }
-}
-```
-
-**Set Default Fabric Label**
-
-Set the default fabric label that will be set on a node after successful commissioning.
-
-```json
-{
-  "message_id": "1",
-  "command": "set_default_fabric_label",
-  "args": {
-    "label": "My Home"
-  }
-}
-```
-
-**Update Fabric Label**
-
-Update the fabric label of an already commissioned node.
-
-```json
-{
-  "message_id": "1",
-  "command": "update_fabric_label",
-  "args": {
-    "node_id": 1,
-    "label": "Living Room"
-  }
-}
-```
-
-**Commission with code**
-
-Commission a new device using a pairing code. For WiFi or Thread based devices, the credentials need to be set upfront, otherwise, commissioning will fail. Supports both QR-code syntax (MT:...) and manual pairing code as string.
-
-Note: The server includes an optimized BLE commissioning path that extracts the discriminator from the setup code to improve discovery reliability. When credentials are provided, it uses specialized SDK methods to ensure network parameters are correctly passed to the device.
-
-Optional `fabric_label` sets a label for our fabric on the device (visible in `get_fabrics`). Useful in multi-fabric setups to identify which controller owns which entry.
-
-```json
-{
-  "message_id": "2",
-  "command": "commission_with_code",
-  "args": {
-    "code": "MT:Y.ABCDEFG123456789",
-    "fabric_label": "MyServer"
-  }
-}
-```
-
-**Commission on network**
-
-Commission a device already present on the network.
+**`commission_on_network`** — Commission a device already on the network
 
 ```json
 {
@@ -297,15 +374,61 @@ Commission a device already present on the network.
   "args": {
     "setup_pin_code": 12345678,
     "filter_type": 0,
-    "filter": null
+    "filter": null,
+    "fabric_label": "MyServer"
   }
 }
 ```
 
-**Open Commissioning window**
+| Arg | Required | Description |
+|---|---|---|
+| `setup_pin_code` | Yes | Setup PIN code |
+| `filter_type` | No | `FilterType` enum value (0=NONE, 2=LONG_DISCRIMINATOR, etc.) |
+| `filter` | No | Filter value matching `filter_type` |
+| `fabric_label` | No | Label for this fabric on the device |
 
-Open a commissioning window on an already-commissioned device to allow a **second Matter controller** to add it to their fabric (Multi-Fabric Commissioning — Step 1).
-Returns `setup_pin_code`, `setup_manual_code`, and `setup_qr_code` for the second controller to use.
+**Response:** Full `MatterNodeData` of the commissioned node.
+
+---
+
+**`discover_commissionable_nodes`** — Discover devices available for commissioning
+
+Returns the current list of discovered commissionable nodes (via BLE and mDNS).
+New discoveries are also pushed as `discovery_updated` events.
+
+```json
+{ "message_id": "1", "command": "discover_commissionable_nodes" }
+```
+
+**Response:**
+```json
+{
+  "message_id": "1",
+  "result": [
+    {
+      "instance_name": "1A2B3C4D5E6F7A8B",
+      "host_name": "E45F01234567.local.",
+      "port": 5540,
+      "long_discriminator": 3840,
+      "vendor_id": 4151,
+      "product_id": 131,
+      "commissioning_mode": 1,
+      "device_type": 257,
+      "device_name": "Tapo P210M",
+      "pairing_instruction": "",
+      "pairing_hint": 33,
+      "addresses": ["192.168.1.42", "fe80::e65f:1ff:fe23:4567"]
+    }
+  ]
+}
+```
+
+---
+
+**`open_commissioning_window`** — Open a commissioning window on an already-commissioned device
+
+Used for **Multi-Fabric Commissioning (Step 1)**. Returns the pairing codes needed by a
+second controller to add this device to their fabric.
 
 ```json
 {
@@ -319,38 +442,45 @@ Returns `setup_pin_code`, `setup_manual_code`, and `setup_qr_code` for the secon
 }
 ```
 
-**Example Response:**
+| Arg | Required | Default | Description |
+|---|---|---|---|
+| `node_id` | Yes | — | Node whose commissioning window to open |
+| `timeout` | No | `300` | Window open duration in seconds |
+| `iteration` | No | `1000` | PBKDF2 iteration count (higher = slower brute-force) |
+
+**Response:**
 ```json
 {
   "message_id": "2",
   "result": {
-    "setup_pin_code": 12345678,
+    "setup_pin_code": 98765432,
     "setup_manual_code": "35325335079",
-    "setup_qr_code": "MT:Y.ABCDEFG123456789"
+    "setup_qr_code": "MT:Y.ABCDEFG123456789",
+    "discriminator": 3840
   }
 }
 ```
 
 ---
 
-**Commission on Commissioning Window (Multi-Fabric)**
+**`commission_on_commissioning_window`** — Add a device to this fabric via an open commissioning window
 
-Add a device to our fabric when it already belongs to another fabric (Multi-Fabric Commissioning — Step 2).
-Use the `setup_pin_code` and `discriminator` returned by the other controller's `open_commissioning_window` call.
+Used for **Multi-Fabric Commissioning (Step 2)**. Use the `setup_pin_code` and
+`discriminator` returned by another controller's `open_commissioning_window` call.
 
 > **Multi-Fabric flow:**
-> 1. Device is on **Fabric A** (another controller).
-> 2. Fabric A calls `open_commissioning_window(node_id)` → shares `setup_pin_code` + `discriminator` with you.
+> 1. Device is already on **Fabric A** (another controller).
+> 2. Fabric A calls `open_commissioning_window(node_id)` → shares `setup_pin_code` and `discriminator`.
 > 3. You call `commission_on_commissioning_window` → device is now on **both fabrics**.
 >
-> To share **your** device to another fabric: call `open_commissioning_window` on your node and give the returned codes to the other controller.
+> To share **your** device: call `open_commissioning_window` on your node and give the codes to the other controller.
 
 ```json
 {
   "message_id": "2",
   "command": "commission_on_commissioning_window",
   "args": {
-    "setup_pin_code": 12345678,
+    "setup_pin_code": 98765432,
     "discriminator": 3840,
     "ip_addr": null,
     "fabric_label": "MyServer"
@@ -362,32 +492,51 @@ Use the `setup_pin_code` and `discriminator` returned by the other controller's 
 |---|---|---|
 | `setup_pin_code` | Yes | From the other controller's `open_commissioning_window` result |
 | `discriminator` | Yes | From the other controller's `open_commissioning_window` result |
-| `ip_addr` | No | Direct IP to skip mDNS discovery (faster, use when IP is known) |
-| `fabric_label` | No | Label to identify our fabric on the device (visible in `get_fabrics`) |
+| `ip_addr` | No | Direct IP to skip mDNS discovery (use when IP is known) |
+| `fabric_label` | No | Label to identify this fabric on the device |
 
-Returns `MatterNodeData` of the newly commissioned node.
-
-After commissioning, call `get_fabrics(node_id)` to confirm the device is on multiple fabrics.
+**Response:** Full `MatterNodeData` of the commissioned node.
 
 ---
 
-**Get Fabrics**
-
-Get all fabrics commissioned on a node.
+**`get_fabrics`** — List all fabrics a node belongs to
 
 ```json
 {
   "message_id": "1",
   "command": "get_fabrics",
-  "args": {
-    "node_id": 1
-  }
+  "args": { "node_id": 1 }
 }
 ```
 
-**Remove Fabric**
+**Response:**
+```json
+{
+  "message_id": "1",
+  "result": [
+    {
+      "fabric_index": 1,
+      "root_public_key": "...",
+      "vendor_id": 4937,
+      "fabric_id": 1,
+      "node_id": 1,
+      "label": "MyServer"
+    },
+    {
+      "fabric_index": 2,
+      "root_public_key": "...",
+      "vendor_id": 4937,
+      "fabric_id": 2,
+      "node_id": 1,
+      "label": "HomeAssistant"
+    }
+  ]
+}
+```
 
-Remove a specific fabric from a node.
+---
+
+**`remove_fabric`** — Remove a specific fabric from a node
 
 ```json
 {
@@ -395,80 +544,136 @@ Remove a specific fabric from a node.
   "command": "remove_fabric",
   "args": {
     "node_id": 1,
-    "fabric_index": 1
+    "fabric_index": 2
   }
 }
 ```
 
-### Node Management
+**Response:** `{ "message_id": "1", "result": null }`
 
-**Get Nodes**
+---
 
-Get all nodes already commissioned on the controller.
+**`update_fabric_label`** — Update the fabric label on an already-commissioned node
 
 ```json
 {
-  "message_id": "2",
-  "command": "get_nodes"
+  "message_id": "1",
+  "command": "update_fabric_label",
+  "args": {
+    "node_id": 1,
+    "label": "LivingRoom"
+  }
 }
 ```
 
-**Get Node**
+**Response:** `{ "message_id": "1", "result": null }`
 
-Get info of a single Node.
+---
+
+### Node Management
+
+---
+
+**`get_nodes`** — Get all commissioned nodes
+
+```json
+{ "message_id": "2", "command": "get_nodes" }
+```
+
+**Response:**
+```json
+{
+  "message_id": "2",
+  "result": [
+    {
+      "node_id": 1,
+      "date_commissioned": "2026-03-20T09:00:00",
+      "last_interview": "2026-03-26T08:00:00",
+      "interview_version": 3,
+      "available": true,
+      "is_bridge": false,
+      "attributes": {
+        "0/40/3": "Tapo",
+        "0/40/4": "P210M",
+        "1/6/0": false
+      }
+    }
+  ]
+}
+```
+
+---
+
+**`get_node`** — Get a single node by ID
 
 ```json
 {
   "message_id": "2",
   "command": "get_node",
-  "args": {
-    "node_id": 1
+  "args": { "node_id": 1 }
+}
+```
+
+**Response:** Single `MatterNodeData` object (same shape as items in `get_nodes`).
+
+---
+
+**`start_listening`** — Subscribe to all node events
+
+After sending this command, the server dumps all existing nodes in the response and then
+continuously pushes `attribute_updated`, `node_added`, `node_removed`, and other events.
+
+```json
+{ "message_id": "3", "command": "start_listening" }
+```
+
+**Response:**
+```json
+{
+  "message_id": "3",
+  "result": {
+    "nodes": [
+      { "node_id": 1, "available": true, "...": "..." }
+    ]
   }
 }
 ```
 
-**Start listening**
+---
 
-When the `start_listening` command is issued, the server will dump all existing nodes. From that moment on all events (including node attribute changes) will be forwarded.
+**`interview_node`** — Re-interview a node (read all attributes fresh)
 
-```json
-{
-  "message_id": "3",
-  "command": "start_listening"
-}
-```
-
-**Interview Node**
-
-Manually trigger a full interview of a node.
+Triggers a full attribute read and updates the server's cached node data.
 
 ```json
 {
   "message_id": "1",
   "command": "interview_node",
-  "args": {
-    "node_id": 1
-  }
+  "args": { "node_id": 1 }
 }
 ```
 
-**Remove Node**
+**Response:** `{ "message_id": "1", "result": null }`
 
-Remove a Matter node/device from the fabric.
+---
+
+**`remove_node`** — Remove a node from the fabric
+
+Sends `RemoveFabric` to the device and removes it from the server.
 
 ```json
 {
   "message_id": "1",
   "command": "remove_node",
-  "args": {
-    "node_id": 1
-  }
+  "args": { "node_id": 1 }
 }
 ```
 
-**Ping Node**
+**Response:** `{ "message_id": "1", "result": null }`
 
-Ping node on the currently known IP-address(es).
+---
+
+**`ping_node`** — Ping a node by IP address
 
 ```json
 {
@@ -481,9 +686,20 @@ Ping node on the currently known IP-address(es).
 }
 ```
 
-**Get Node IP Addresses**
+**Response:**
+```json
+{
+  "message_id": "1",
+  "result": {
+    "192.168.1.42": true,
+    "fe80::e65f:1ff:fe23:4567": false
+  }
+}
+```
 
-Return the currently known (scoped) IP-address(es) for a node.
+---
+
+**`get_node_ip_addresses`** — Get known IP addresses for a node
 
 ```json
 {
@@ -497,11 +713,171 @@ Return the currently known (scoped) IP-address(es) for a node.
 }
 ```
 
+| Arg | Required | Default | Description |
+|---|---|---|---|
+| `node_id` | Yes | — | Target node |
+| `prefer_cache` | No | `false` | Return cached addresses without resolving mDNS |
+| `scoped` | No | `false` | Return link-local addresses with interface scope (e.g. `fe80::1%eth0`) |
+
+**Response:**
+```json
+{
+  "message_id": "1",
+  "result": ["192.168.1.42", "fe80::e65f:1ff:fe23:4567"]
+}
+```
+
+---
+
+### Attributes and Commands
+
+---
+
+**`read_attribute`** — Read a specific attribute from a node
+
+Attribute path format: `ENDPOINT_ID/CLUSTER_ID/ATTRIBUTE_ID`
+
+```json
+{
+  "message_id": "read1",
+  "command": "read_attribute",
+  "args": {
+    "node_id": 1,
+    "attribute_path": "1/6/0"
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "message_id": "read1",
+  "result": false
+}
+```
+
+Common attribute paths:
+
+| Path | Description |
+|---|---|
+| `1/6/0` | OnOff cluster, OnOff attribute (endpoint 1) |
+| `1/8/0` | LevelControl cluster, CurrentLevel |
+| `1/768/1` | ColorControl cluster, CurrentHue |
+| `0/40/3` | BasicInformation, VendorName |
+| `0/40/5` | BasicInformation, NodeLabel |
+
+---
+
+**`write_attribute`** — Write a value to a node attribute
+
+```json
+{
+  "message_id": "write1",
+  "command": "write_attribute",
+  "args": {
+    "node_id": 1,
+    "attribute_path": "1/6/16385",
+    "value": 100
+  }
+}
+```
+
+**Response:** `{ "message_id": "write1", "result": null }`
+
+---
+
+**`device_command`** — Send a cluster command to a node endpoint
+
+```json
+{
+  "message_id": "cmd1",
+  "command": "device_command",
+  "args": {
+    "node_id": 1,
+    "endpoint_id": 1,
+    "cluster_id": 6,
+    "command_name": "On",
+    "payload": {}
+  }
+}
+```
+
+**Response:** Command response payload (or `null` if the command has no response).
+
+```json
+{ "message_id": "cmd1", "result": null }
+```
+
+**Example — move brightness to 50%:**
+```json
+{
+  "message_id": "cmd2",
+  "command": "device_command",
+  "args": {
+    "node_id": 1,
+    "endpoint_id": 1,
+    "cluster_id": 8,
+    "command_name": "MoveToLevelWithOnOff",
+    "payload": { "level": 128, "transitionTime": 0 }
+  }
+}
+```
+
+---
+
+**`set_acl_entry`** — Set Access Control List entries on a node
+
+```json
+{
+  "message_id": "1",
+  "command": "set_acl_entry",
+  "args": {
+    "node_id": 1,
+    "entry": []
+  }
+}
+```
+
+**Response:** `{ "message_id": "1", "result": null }`
+
+---
+
+**`set_node_binding`** — Set bindings on a node endpoint
+
+```json
+{
+  "message_id": "1",
+  "command": "set_node_binding",
+  "args": {
+    "node_id": 1,
+    "endpoint": 1,
+    "bindings": []
+  }
+}
+```
+
+**Response:** `{ "message_id": "1", "result": null }`
+
+---
+
 ### Groups and Bindings
 
-**Group Add**
+Groups in Matter are managed entirely on the **device** — the server does not maintain a
+group registry. Group membership is stored on each endpoint via the Groups cluster and
+is queried directly from the device with `group_get_membership`.
 
-Add a node's endpoint to a group.
+---
+
+**`group_add`** — Add a node endpoint to a group
+
+The server:
+1. Validates the endpoint supports the Groups cluster via `Descriptor.ServerList`
+2. Generates a random 128-bit epoch key for the group (first time only) and injects it into the controller's `GroupDataProvider`
+3. Provisions the node via `GroupKeyManagement.KeySetWrite` + `GroupKeyMap`
+4. Sends `Groups.AddGroup` to the device endpoint
+
+Call this once per endpoint/node you want to add to the group. Group membership is stored
+on the device — not on the server.
 
 ```json
 {
@@ -510,15 +886,37 @@ Add a node's endpoint to a group.
   "args": {
     "node_id": 1,
     "endpoint": 1,
-    "group_id": 1,
-    "group_name": "My Group"
+    "group_id": 100,
+    "group_name": "Living Room Lights"
   }
 }
 ```
 
-**Group Remove**
+| Arg | Required | Description |
+|---|---|---|
+| `node_id` | Yes | Node to add to the group |
+| `endpoint` | Yes | Endpoint on that node (must support Groups cluster) |
+| `group_id` | Yes | Group ID (1–65527). Shared across all members. |
+| `group_name` | Yes | Human-readable name stored on the device (max 16 chars) |
 
-Remove a node's endpoint from a group.
+**Response:** `{ "message_id": "1", "result": null }`
+
+**Errors:**
+- `InvalidArguments` — endpoint does not support the Groups cluster
+
+**Typical workflow:**
+```
+group_add(node_id=1, endpoint=1, group_id=100, group_name="Lights")
+group_add(node_id=2, endpoint=1, group_id=100, group_name="Lights")
+group_add(node_id=3, endpoint=1, group_id=100, group_name="Lights")
+→ group_send_command(group_id=100, cluster_id=6, command_name="On", payload={})
+```
+
+---
+
+**`group_remove`** — Remove a node endpoint from a group
+
+Sends `Groups.RemoveGroup` to the device endpoint.
 
 ```json
 {
@@ -527,14 +925,19 @@ Remove a node's endpoint from a group.
   "args": {
     "node_id": 1,
     "endpoint": 1,
-    "group_id": 1
+    "group_id": 100
   }
 }
 ```
 
-**Group Get Membership**
+**Response:** `{ "message_id": "1", "result": null }`
 
-Get all groups a node's endpoint belongs to.
+---
+
+**`group_get_membership`** — Query which groups an endpoint belongs to
+
+Sends `Groups.GetGroupMembership` to the device. Returns live data from the device — the
+server does not cache group membership.
 
 ```json
 {
@@ -547,17 +950,33 @@ Get all groups a node's endpoint belongs to.
 }
 ```
 
-**Group Send Command**
+**Response:**
+```json
+{
+  "message_id": "1",
+  "result": [100, 200, 300]
+}
+```
 
-Send a command to a group of nodes.
-Note: The server will automatically use generated keys. If a node was manually modified outside of the server, you may encounter `Internal Error (0xAC)`, in which case the server attempts to automatically re-provision it if possible.
+The result is the list of group IDs this endpoint currently belongs to.
+
+---
+
+**`group_send_command`** — Send a command to a group using Matter multicast (groupcast)
+
+The CHIP controller sends a single encrypted multicast frame addressed to the group ID.
+No per-node unicast loop is used. All nodes that are members of the group and have matching
+keys will process the command simultaneously.
+
+The group must have at least one endpoint added via `group_add` so that the controller has
+the encryption keys for that group ID.
 
 ```json
 {
   "message_id": "1",
   "command": "group_send_command",
   "args": {
-    "group_id": 1,
+    "group_id": 100,
     "cluster_id": 6,
     "command_name": "On",
     "payload": {}
@@ -565,14 +984,28 @@ Note: The server will automatically use generated keys. If a node was manually m
 }
 ```
 
-**Common Errors during Group Commands:**
-- `CHIP Error 0xAC (Internal Error)`: The controller doesn't have the group keys for the specified group ID. Ensure the group was created via the API (`add_group`) before sending commands.
-- `CHIP Error 0x32 (Timeout)`: Operational discovery of one or more nodes in the group failed. This means the node is unreachable on the network or its mDNS record could not be found. Check if the device is powered on and connected to the same network.
+| Arg | Required | Description |
+|---|---|---|
+| `group_id` | Yes | Target group ID |
+| `cluster_id` | Yes | Matter cluster ID (e.g. 6 = OnOff, 8 = LevelControl) |
+| `command_name` | Yes | Command name as a string (e.g. `"On"`, `"MoveToLevel"`) |
+| `payload` | Yes | Command arguments as a JSON object. Use `{}` for no-argument commands. |
 
-**Group Add Key Set**
+**Response:** `{ "message_id": "1", "result": null }`
 
-Add a group key set to a node. This is required for real devices to receive group commands.
-Standard test key (if omitted): `0102030405060708090a0b0c0d0e0f10`
+> `group_send_command` is fire-and-forget — Matter groupcast does not have acknowledgements.
+> There is no confirmation that individual nodes received or executed the command.
+
+**Common Errors:**
+- `CHIP Error 0xAC (Internal Error)` — The controller lacks encryption keys for this group ID. Call `group_add` first to provision the controller and nodes. If keys were orphaned (e.g. after calling `init_group_testing_data`), the server automatically re-injects them and retries once.
+- `CHIP Error 0x32 (Timeout)` — A CASE session could not be established with a node (mDNS lookup failed or device is offline). This does not affect groupcast delivery to other online nodes.
+
+---
+
+**`group_add_key_set`** — Manually install a group key set on a node
+
+Sends `GroupKeyManagement.KeySetWrite` to the node's endpoint 0. This is called
+automatically by `group_add` — only use this for advanced/manual key management.
 
 ```json
 {
@@ -580,15 +1013,26 @@ Standard test key (if omitted): `0102030405060708090a0b0c0d0e0f10`
   "command": "group_add_key_set",
   "args": {
     "node_id": 1,
-    "keyset_id": 1,
+    "keyset_id": 100,
     "key_hex": "0102030405060708090a0b0c0d0e0f10"
   }
 }
 ```
 
-**Group Bind Key Set**
+| Arg | Required | Default | Description |
+|---|---|---|---|
+| `node_id` | Yes | — | Target node |
+| `keyset_id` | Yes | — | Keyset ID (1–65534) |
+| `key_hex` | No | `"0102030405060708090a0b0c0d0e0f10"` | 16-byte epoch key as hex |
 
-Bind a group ID to a keyset ID on a node.
+**Response:** `{ "message_id": "1", "result": null }`
+
+---
+
+**`group_bind_key_set`** — Manually bind a group ID to a keyset on a node
+
+Writes to `GroupKeyManagement.GroupKeyMap` (attribute 0) on endpoint 0. This is called
+automatically by `group_add` — only use this for advanced/manual key management.
 
 ```json
 {
@@ -596,67 +1040,34 @@ Bind a group ID to a keyset ID on a node.
   "command": "group_bind_key_set",
   "args": {
     "node_id": 1,
-    "group_id": 1,
-    "keyset_id": 1
+    "group_id": 100,
+    "keyset_id": 100
   }
 }
 ```
 
-**Init Group Testing Data**
+**Response:** `{ "message_id": "1", "result": null }`
 
-Initialize the controller with test group keys. Required for group commands in development.
-Note: This is automatically called by the server at startup, but can be called manually if needed.
+---
 
-```json
-{
-  "message_id": "1",
-  "command": "init_group_testing_data"
-}
-```
+**`init_group_testing_data`** — Populate controller with hardcoded test group keys
 
-**Get Groups**
+Initializes the controller's `GroupDataProvider` with test keys for group IDs **257** and
+**258** only. Use in development/testing environments with test devices.
 
-Get all groups in the server registry.
+> **Warning:** Do not call this after creating production groups. It rewrites the
+> controller's group-key linked list and will orphan custom group keys, causing
+> `SendGroupCommand` to fail with `0xAC` for any custom group IDs.
 
 ```json
-{
-  "message_id": "1",
-  "command": "get_groups"
-}
+{ "message_id": "1", "command": "init_group_testing_data" }
 ```
 
-**Add Group**
+**Response:** `{ "message_id": "1", "result": null }`
 
-Add a group to the server registry.
+---
 
-```json
-{
-  "message_id": "1",
-  "command": "add_group",
-  "args": {
-    "group_id": 1,
-    "group_name": "My Group"
-  }
-}
-```
-
-**Remove Group**
-
-Remove a group from the server registry.
-
-```json
-{
-  "message_id": "1",
-  "command": "remove_group",
-  "args": {
-    "group_id": 1
-  }
-}
-```
-
-**Binding Add**
-
-Add a binding to a node's endpoint.
+**`binding_add`** — Add a binding to a node endpoint
 
 ```json
 {
@@ -672,9 +1083,11 @@ Add a binding to a node's endpoint.
 }
 ```
 
-**Binding Remove**
+**Response:** `{ "message_id": "1", "result": null }`
 
-Remove a binding from a node's endpoint.
+---
+
+**`binding_remove`** — Remove a binding from a node endpoint
 
 ```json
 {
@@ -690,107 +1103,43 @@ Remove a binding from a node's endpoint.
 }
 ```
 
-### Attributes and Commands
+**Response:** `{ "message_id": "1", "result": null }`
 
-**Read an attribute**
-
-Here is an example of reading `OnOff` attribute on a switch (OnOff cluster)
-
-```json
-{
-  "message_id": "read",
-  "command": "read_attribute",
-  "args": {
-    "node_id": 1,
-    "attribute_path": "1/6/0"
-  }
-}
-```
-
-**Write an attribute**
-
-Here is an example of writing `OnTime` attribute on a switch (OnOff cluster)
-
-```json
-{
-  "message_id": "write",
-  "command": "write_attribute",
-  "args": {
-    "node_id": 1,
-    "attribute_path": "1/6/16385",
-    "value": 10
-  }
-}
-```
-
-**Send a command**
-
-Here is an example of turning on a switch (OnOff cluster)
-
-```json
-{
-  "message_id": "example",
-  "command": "device_command",
-  "args": {
-    "endpoint_id": 1,
-    "node_id": 1,
-    "payload": {},
-    "cluster_id": 6,
-    "command_name": "On"
-  }
-}
-```
-
-**Set ACL Entry**
-
-Set access control entries for a node.
-
-```json
-{
-  "message_id": "1",
-  "command": "set_acl_entry",
-  "args": {
-    "node_id": 1,
-    "entry": []
-  }
-}
-```
-
-**Set Node Binding**
-
-Set bindings for a node.
-
-```json
-{
-  "message_id": "1",
-  "command": "set_node_binding",
-  "args": {
-    "node_id": 1,
-    "endpoint": 1,
-    "bindings": []
-  }
-}
-```
+---
 
 ### OTA Updates
 
-**Check Node Update**
+---
 
-Check if there is an update for a particular node.
+**`check_node_update`** — Check if a firmware update is available for a node
 
 ```json
 {
   "message_id": "1",
   "command": "check_node_update",
-  "args": {
-    "node_id": 1
+  "args": { "node_id": 1 }
+}
+```
+
+**Response:**
+```json
+{
+  "message_id": "1",
+  "result": {
+    "software_version": 2,
+    "software_version_string": "2.0.0",
+    "update_token": "...",
+    "min_applicable_software_version": 0,
+    "max_applicable_software_version": 1
   }
 }
 ```
 
-**Update Node**
+Returns `null` if no update is available.
 
-Update a node to a new software version.
+---
+
+**`update_node`** — Start an OTA firmware update on a node
 
 ```json
 {
@@ -798,62 +1147,80 @@ Update a node to a new software version.
   "command": "update_node",
   "args": {
     "node_id": 1,
-    "software_version": 123
+    "software_version": 2
   }
 }
 ```
 
+**Response:** `{ "message_id": "1", "result": null }`
+
+---
+
 ### Miscellaneous
 
-**Import Test Node**
+---
 
-Import test node(s) from a HA or Matter server diagnostics dump.
+**`import_test_node`** — Import test node(s) from a diagnostics dump
+
+Accepts a Home Assistant or Matter server diagnostics JSON dump. Useful for testing
+without physical hardware.
 
 ```json
 {
   "message_id": "1",
   "command": "import_test_node",
   "args": {
-    "dump": "{...}"
+    "dump": "{\"data\": {\"node\": {...}}}"
   }
 }
 ```
 
-## Websocket events
+**Response:** `{ "message_id": "1", "result": null }`
 
-When a client is listening (after sending the `start_listening` command), it will receive events from the server.
+---
 
-**Node Added**
+## WebSocket Events
 
-Fired when a new node is added to the fabric.
+After sending `start_listening`, the server pushes events as they occur.
+Each event has the shape `{ "event": "event_name", "data": ... }`.
+
+---
+
+**`node_added`** — A new node was commissioned and added to the fabric
 
 ```json
 {
   "event": "node_added",
   "data": {
-    "node_id": 1,
-    "...": "..."
+    "node_id": 4,
+    "date_commissioned": "2026-03-26T10:00:00",
+    "last_interview": "2026-03-26T10:00:05",
+    "interview_version": 1,
+    "available": true,
+    "is_bridge": false,
+    "attributes": { "0/40/3": "Tapo", "1/6/0": false }
   }
 }
 ```
 
-**Node Updated**
+---
 
-Fired when a node's information is updated.
+**`node_updated`** — A node's information was updated (e.g. after re-interview)
 
 ```json
 {
   "event": "node_updated",
   "data": {
     "node_id": 1,
-    "...": "..."
+    "available": true,
+    "attributes": { "0/40/3": "Tapo", "1/6/0": true }
   }
 }
 ```
 
-**Node Removed**
+---
 
-Fired when a node is removed from the fabric.
+**`node_removed`** — A node was removed from the fabric
 
 ```json
 {
@@ -862,95 +1229,139 @@ Fired when a node is removed from the fabric.
 }
 ```
 
-**Discovery Updated**
+`data` is the `node_id` of the removed node.
 
-Fired when a commissionable node is discovered or disappears from mDNS.
+---
 
-```json
-{
-  "event": "discovery_updated",
-  "data": {
-    "instance_name": "...",
-    "host_name": "...",
-    "port": 5540,
-    "long_discriminator": 1234,
-    "vendor_id": 1,
-    "product_id": 1,
-    "commissioning_mode": 1,
-    "device_type": 1,
-    "device_name": "...",
-    "pairing_instruction": "...",
-    "pairing_hint": 1,
-    "addresses": ["..."]
-  }
-}
-```
-
-Or for removal:
-
-```json
-{
-  "event": "discovery_updated",
-  "data": {
-    "name": "...",
-    "removed": true
-  }
-}
-```
-
-**Commissioning Progress**
-
-Fired during the commissioning process.
-
-```json
-{
-  "event": "commissioning_progress",
-  "data": {
-    "node_id": 1,
-    "stage": "started"
-  }
-}
-```
-
-**Attribute Updated**
-
-Fired when an attribute value changes.
+**`attribute_updated`** — An attribute value changed on a node
 
 ```json
 {
   "event": "attribute_updated",
-  "data": [
-    1,
-    "1/6/0",
-    true
-  ]
+  "data": [1, "1/6/0", true]
 }
 ```
 
-**Node Event**
+`data` is `[node_id, attribute_path, new_value]`.
 
-Fired when a node event occurs.
+---
+
+**`node_event`** — A cluster event was fired on a node
 
 ```json
 {
   "event": "node_event",
   "data": {
     "node_id": 1,
-    "endpoint_id": 0,
-    "cluster_id": 1,
-    "event_id": 1,
-    "event_number": 1,
+    "endpoint_id": 1,
+    "cluster_id": 6,
+    "event_id": 0,
+    "event_number": 42,
     "priority": 1,
-    "timestamp": 123456789,
+    "timestamp": 1711446000000,
     "timestamp_type": 0,
     "data": {}
   }
 }
 ```
 
-**Server Shutdown**
+---
 
-Fired when the server is shutting down.
+**`discovery_updated`** — A commissionable node was discovered or disappeared from mDNS/BLE
+
+New discovery:
+```json
+{
+  "event": "discovery_updated",
+  "data": {
+    "instance_name": "1A2B3C4D5E6F7A8B",
+    "host_name": "E45F01234567.local.",
+    "port": 5540,
+    "long_discriminator": 3840,
+    "vendor_id": 4151,
+    "product_id": 131,
+    "commissioning_mode": 1,
+    "device_type": 257,
+    "device_name": "Tapo P210M",
+    "pairing_instruction": "",
+    "pairing_hint": 33,
+    "addresses": ["192.168.1.42"]
+  }
+}
+```
+
+Node disappeared:
+```json
+{
+  "event": "discovery_updated",
+  "data": {
+    "name": "1A2B3C4D5E6F7A8B._matterc._udp.local.",
+    "removed": true
+  }
+}
+```
+
+---
+
+**`commissioning_progress`** — Progress update during commissioning
+
+```json
+{
+  "event": "commissioning_progress",
+  "data": {
+    "node_id": 4,
+    "stage": "started"
+  }
+}
+```
+
+`stage` values: `"started"`, `"commissioning"`, `"interview"`, `"done"`, `"failed"`
+
+---
+
+**`endpoint_added`** — An endpoint was added to a node (e.g. bridge child device added)
+
+```json
+{
+  "event": "endpoint_added",
+  "data": {
+    "node_id": 1,
+    "endpoint_id": 3
+  }
+}
+```
+
+---
+
+**`endpoint_removed`** — An endpoint was removed from a node
+
+```json
+{
+  "event": "endpoint_removed",
+  "data": {
+    "node_id": 1,
+    "endpoint_id": 3
+  }
+}
+```
+
+---
+
+**`server_info_updated`** — Server state changed (e.g. WiFi credentials updated)
+
+```json
+{
+  "event": "server_info_updated",
+  "data": {
+    "wifi_credentials_set": true,
+    "thread_credentials_set": false
+  }
+}
+```
+
+---
+
+**`server_shutdown`** — Server is shutting down
 
 ```json
 {
@@ -959,85 +1370,69 @@ Fired when the server is shutting down.
 }
 ```
 
-**Server Info Updated**
+---
 
-Fired when the server information is updated.
-
-```json
-{
-  "event": "server_info_updated",
-  "data": {
-    "...": "..."
-  }
-}
-```
-
-**Endpoint Added**
-
-Fired when an endpoint is added to a node.
-
-```json
-{
-  "event": "endpoint_added",
-  "data": {
-    "node_id": 1,
-    "endpoint_id": 1
-  }
-}
-```
-
-**Endpoint Removed**
-
-Fired when an endpoint is removed from a node.
-
-```json
-{
-  "event": "endpoint_removed",
-  "data": {
-    "node_id": 1,
-    "endpoint_id": 1
-  }
-}
-```
-
-## Python script to send a command
-
-Because we use the datamodels of the Matter SDK, this is a little bit more involved.
-Here is an example of turning on a switch:
+## Python Client Example
 
 ```python
+import asyncio
 import json
+import websockets
 
-# Import the CHIP clusters
+async def turn_on_switch():
+    uri = "ws://localhost:5580/ws"
+    async with websockets.connect(uri) as ws:
+        # Wait for server_info push
+        server_info = json.loads(await ws.recv())
+        print("Connected:", server_info)
+
+        # Start listening to receive events
+        await ws.send(json.dumps({"message_id": "1", "command": "start_listening"}))
+        response = json.loads(await ws.recv())
+        nodes = response["result"]["nodes"]
+        print(f"Commissioned nodes: {[n['node_id'] for n in nodes]}")
+
+        # Turn on a switch (OnOff cluster, endpoint 1)
+        await ws.send(json.dumps({
+            "message_id": "cmd1",
+            "command": "device_command",
+            "args": {
+                "node_id": 1,
+                "endpoint_id": 1,
+                "cluster_id": 6,
+                "command_name": "On",
+                "payload": {}
+            }
+        }))
+        result = json.loads(await ws.recv())
+        print("Command result:", result)
+
+asyncio.run(turn_on_switch())
+```
+
+**Using the built-in Python SDK types:**
+
+```python
 from chip.clusters import Objects as clusters
+from matter_server.common.helpers.util import dataclass_from_dict, dataclass_to_dict
 
-# Import the ability to turn objects into dictionaries, and vice-versa
-from matter_server.common.helpers.util import dataclass_from_dict,dataclass_to_dict
-
-command = clusters.OnOff.Commands.On()
-payload = dataclass_to_dict(command)
-
+# Build a MoveToLevel command with a level of 128 (50%)
+command = clusters.LevelControl.Commands.MoveToLevelWithOnOff(
+    level=128,
+    transitionTime=0,
+    optionsMask=0,
+    optionsOverride=0,
+)
 
 message = {
-    "message_id": "example",
+    "message_id": "level1",
     "command": "device_command",
     "args": {
-        "endpoint_id": 1,
         "node_id": 1,
-        "payload": payload,
+        "endpoint_id": 1,
         "cluster_id": command.cluster_id,
-        "command_name": "On"
+        "command_name": "MoveToLevelWithOnOff",
+        "payload": dataclass_to_dict(command),
     }
 }
-
-print(json.dumps(message, indent=2))
-```
-
-You can also provide parameters for the cluster commands. Here's how to change the brightness for example:
-
-```python
-command = clusters.LevelControl.Commands.MoveToLevelWithOnOff(
-  level=int(value), # provide a percentage
-  transitionTime=0, # in seconds
-)
 ```

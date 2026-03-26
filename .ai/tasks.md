@@ -22,6 +22,9 @@
 - [x] Fix `group_add` failures: added `timed_request_timeout_ms=5000` to `AddGroup` send_command, added timed-write support to `write_attribute` in `sdk.py` + `group_bind_key_set`, increased `group_add_key_set` timeout from 1000ms to 5000ms.
 - [x] Fix `group_send_command` silent failures: fixed early-return guard for test group IDs (257+) and set `epochStartTime0=1` for non-test groups (satisfies Matter spec §11.2.6.1.1).
 
+- [x] Refactor group management to be Matter spec-compliant: removed server-side group registry (`add_group`/`remove_group`/`get_groups`/`MatterGroupInfo`), removed auto `init_group_testing_data` at startup, added `Descriptor.ServerList` validation in `group_add`, simplified controller key injection (`_inject_controller_group_keys` replaces `_ensure_controller_group_keys` + `_overwrite_controller_keyset`).
+- [x] Rewrite `docs/websockets_api.md` with full descriptions, parameter tables, and example responses for every command and event.
+
 ## Backlog
 - [ ] Add `discover` command to `scripts/cli_client.py`.
 - [ ] Investigate why `discovery_updated` events are not appearing in the dashboard (optional).

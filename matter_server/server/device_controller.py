@@ -75,7 +75,6 @@ from ..common.models import (
     APICommand,
     EventType,
     MatterFabricInfo,
-    MatterGroupInfo,
     MatterNodeData,
     MatterNodeEvent,
     NodePingResult,
@@ -90,7 +89,7 @@ if TYPE_CHECKING:
     from .server import MatterServer
 
 DATA_KEY_NODES = "nodes"
-DATA_KEY_GROUPS = "groups"
+DATA_KEY_GROUP_KEYS = "group_keys"
 DATA_KEY_LAST_NODE_ID = "last_node_id"
 _MATTER_BLE_SERVICE_UUID = "0000fff6-0000-1000-8000-00805f9b34fb"
 
@@ -185,7 +184,10 @@ class MatterDeviceController:
         self._thread_node_setup_throttle = asyncio.Semaphore(5)
         self._mdns_event_timer: dict[str, asyncio.TimerHandle] = {}
         self._polled_attributes: dict[int, set[str]] = {}
-        self._groups: dict[int, MatterGroupInfo] = {}
+        # Minimal crypto store: group_id → (keyset_id, epoch_key_hex)
+        # Keys are injected into controller KVS so SendGroupCommand can encrypt frames.
+        # Membership is stored on devices (via Groups cluster), NOT here.
+        self._group_key_store: dict[int, tuple[int, str]] = {}
         self._custom_attribute_poller_timer: asyncio.TimerHandle | None = None
         self._custom_attribute_poller_task: asyncio.Task | None = None
         self._attribute_update_callbacks: dict[int, list[Callable]] = {}
@@ -200,29 +202,18 @@ class MatterDeviceController:
 
     async def start(self) -> None:
         """Handle logic on controller start."""
-        # Initialize test group data FIRST so that our custom key injection
-        # (below) can prepend to the FabricData linked lists C++ just wrote.
-        # If this runs AFTER _ensure_controller_group_keys, the C++ call
-        # overwrites FabricData and orphans our custom group entries, causing
-        # CHIP Error 0x000000AC (Internal error) on every SendGroupCommand.
-        try:
-            await self._chip_device_controller.init_group_testing_data()
-        except Exception as err:  # noqa: BLE001, pylint: disable=broad-except
-            LOGGER.warning("Failed to initialize group testing data: %s", err)
-
-        # Load groups from persistent storage and inject custom keys AFTER
-        # init_group_testing_data so our FabricData update is not overwritten.
-        groups: dict[str, dict] = self.server.storage.get(DATA_KEY_GROUPS, {})
-        for group_id_str, group_dict in groups.items():
+        # Load group crypto material from persistent storage.
+        # Keys are already injected into the SDK's KVS (chip.json) from when each
+        # group was first created via group_add — no re-injection needed on startup.
+        # This store is used only to provision new nodes with matching keys.
+        stored_keys: dict[str, dict] = self.server.storage.get(DATA_KEY_GROUP_KEYS, {})
+        for group_id_str, key_dict in stored_keys.items():
             group_id = int(group_id_str)
-            group_info = MatterGroupInfo(**group_dict)
-            self._groups[group_id] = group_info
-            # Re-derive and overwrite the keyset KVS entry on every startup.
-            # This is a migration that fixes groups created before the key-derivation
-            # bug was fixed (raw epoch key was stored instead of HKDF-derived key).
-            self._overwrite_controller_keyset(group_info)
-            self._ensure_controller_group_keys(group_info)
-        LOGGER.info("Loaded %s groups from stored configuration", len(self._groups))
+            self._group_key_store[group_id] = (
+                key_dict["keyset_id"],
+                key_dict["epoch_key_hex"],
+            )
+        LOGGER.info("Loaded %d group key entries", len(self._group_key_store))
 
         # load nodes from persistent storage
         nodes: dict[str, dict | None] = self.server.storage.get(DATA_KEY_NODES, {})
@@ -1438,27 +1429,54 @@ class MatterDeviceController:
     async def group_add(
         self, node_id: int, endpoint: int, group_id: int, group_name: str
     ) -> None:
-        """Add node to a group."""
-        # update our local registry if the group is new
-        if group_id not in self._groups:
-            self.add_group(group_id, group_name)
+        """Add a node endpoint to a group.
 
-        group = self._groups[group_id]
+        Follows the Matter spec:
+        1. Validates Groups cluster support via Descriptor.ServerList.
+        2. Generates and stores group encryption keys (first time only).
+        3. Injects keys into the controller's GroupDataProvider (KVS).
+        4. Provisions the node via GroupKeyManagement.KeySetWrite + GroupKeyMap.
+        5. Sends Groups.AddGroup to the device endpoint.
 
-        # Ensure node has the group keyset if we have it locally
-        if group.keyset_id is not None and group.epoch_key_hex is not None:
-            try:
-                await self.group_add_key_set(
-                    node_id, group.keyset_id, group.epoch_key_hex
-                )
-                await self.group_bind_key_set(node_id, group_id, group.keyset_id)
-            except (ChipStackError, InteractionModelError) as err:
-                LOGGER.warning(
-                    "Failed to provision node %s with group keys, groupcast may not work: %s",
-                    node_id,
-                    err,
-                )
+        Group membership is authoritative on the device, not on the server.
+        """
+        # 1. Validate that the endpoint supports the Groups cluster.
+        if not await self._endpoint_supports_groups(node_id, endpoint):
+            raise InvalidArguments(
+                f"Endpoint {endpoint} on node {node_id} does not support the Groups cluster "
+                "(not listed in Descriptor.ServerList). "
+                "Check the endpoint ID or verify the device capabilities."
+            )
 
+        # 2. Generate keys for this group if we have not seen it before.
+        if group_id not in self._group_key_store:
+            keyset_id = (group_id % 0xFFFE) + 1  # avoids 0 (IPK) and 0xFFFF (invalid)
+            epoch_key_hex = secrets.token_bytes(16).hex()
+            # 3. Inject into controller KVS so SendGroupCommand can encrypt frames.
+            self._inject_controller_group_keys(group_id, keyset_id, epoch_key_hex)
+            # Persist crypto material so we can provision future nodes joining this group.
+            self._group_key_store[group_id] = (keyset_id, epoch_key_hex)
+            self.server.storage.set(
+                DATA_KEY_GROUP_KEYS,
+                {"keyset_id": keyset_id, "epoch_key_hex": epoch_key_hex},
+                subkey=str(group_id),
+            )
+
+        keyset_id, epoch_key_hex = self._group_key_store[group_id]
+
+        # 4. Provision the node with the group's encryption keys.
+        try:
+            await self.group_add_key_set(node_id, keyset_id, epoch_key_hex)
+            await self.group_bind_key_set(node_id, group_id, keyset_id)
+        except (ChipStackError, InteractionModelError) as err:
+            LOGGER.warning(
+                "Failed to provision node %s with group keys — groupcast to this node "
+                "may not work until keys are provisioned: %s",
+                node_id,
+                err,
+            )
+
+        # 5. Send Groups.AddGroup to the device (Matter spec §11.2.6.1).
         await self._chip_device_controller.send_command(
             node_id,
             endpoint,
@@ -1484,11 +1502,6 @@ class MatterDeviceController:
             Clusters.Groups.Commands.GetGroupMembership([]),
         )
         return cast(list[int], read_result.groupList)
-
-    @api_command(APICommand.GET_GROUPS)
-    def get_groups(self) -> list[MatterGroupInfo]:
-        """Return all groups in the server registry."""
-        return list(self._groups.values())
 
     @staticmethod
     def _derive_group_encryption_key(
@@ -1522,31 +1535,33 @@ class MatterDeviceController:
         ).derive(encryption_key)
         return int.from_bytes(hash_bytes, "big")
 
-    def _overwrite_controller_keyset(self, group: MatterGroupInfo) -> None:
-        """Overwrite the keyset KVS entry with correctly-derived keys.
+    def _inject_controller_group_keys(
+        self, group_id: int, keyset_id: int, epoch_key_hex: str
+    ) -> None:
+        """Inject group keyset and key-map into the controller's internal KVS.
 
-        Called at startup for every stored group to migrate groups that were created
-        before the key-derivation bug was fixed (old code stored the raw epoch key).
-        Only updates the keyset; leaves the group-info, map, and fabric-data intact.
+        The CHIP SDK's GroupDataProviderImpl resolves group encryption keys by
+        traversing a linked list stored in the KVS (chip.json).  Because the
+        Python SDK does not expose an API to add arbitrary group keys, we write
+        the TLV entries directly.
+
+        The SDK stores *derived* GroupOperationalCredentials (not raw epoch keys):
+          encryption_key = HKDF-SHA256(epoch_key, CompressedFabricId, "GroupKey v1.0")
+          session_id     = first 2 bytes of HKDF-SHA256(encryption_key, zeros32, "GroupKeyHash")
+
+        Only the KeyMap and KeySet entries are written here — GroupInfo (group
+        name/membership list inside the controller) is not required for
+        SendGroupCommand and is deliberately omitted to keep this layer thin.
         """
-        # pylint: disable=protected-access,broad-exception-caught
-        if group.keyset_id is None or group.epoch_key_hex is None:
-            return
+        # pylint: disable=too-many-locals,protected-access,broad-exception-caught
         try:
             storage = self.server.stack._chip_stack._persistentStorage
             fabric_idx = (
                 self._chip_device_controller._chip_controller.GetFabricIndexInternal()
             )
-            keyset_key_name = f"f/{fabric_idx:x}/k/{group.keyset_id:x}"
-            existing_raw = storage.GetSdkKey(keyset_key_name)
-            if existing_raw is None:
-                return  # doesn't exist yet; _ensure_controller_group_keys will create it
+            invalid_id = 0xFFFF  # kInvalidKeysetId
 
-            # Preserve the linked-list `next` pointer from the existing entry.
-            existing = TLVReader(existing_raw).get()["Any"]
-            old_next = existing.get(7, 0xFFFF)
-
-            epoch_key = bytes.fromhex(group.epoch_key_hex)
+            epoch_key = bytes.fromhex(epoch_key_hex)
             compressed_fabric_id = self._compressed_fabric_id or 0
             encryption_key = self._derive_group_encryption_key(
                 epoch_key, compressed_fabric_id
@@ -1554,128 +1569,31 @@ class MatterDeviceController:
             session_id = self._derive_group_session_id(encryption_key)
             zeroed_key = bytes(16)
 
-            writer = TLVWriter()
-            writer.put(
-                None,
-                {
-                    1: tlv_uint(1),  # policy: kCacheAndSync
-                    2: tlv_uint(1),  # keys_count
-                    3: [
-                        {4: tlv_uint(0), 5: tlv_uint(session_id), 6: encryption_key},
-                        {4: tlv_uint(0), 5: tlv_uint(0), 6: zeroed_key},
-                        {4: tlv_uint(0), 5: tlv_uint(0), 6: zeroed_key},
-                    ],
-                    7: tlv_uint(old_next),
-                },
-            )
-            storage.SetSdkKey(keyset_key_name, writer.encoding)
-            LOGGER.debug(
-                "Refreshed keyset for group %s with correctly-derived key",
-                group.group_id,
-            )
-        except Exception as err:  # noqa: BLE001
-            LOGGER.error(
-                "Failed to refresh controller keyset for group %s: %s",
-                group.group_id,
-                err,
-            )
-
-    def _ensure_controller_group_keys(self, group: MatterGroupInfo) -> None:
-        """Inject group mappings into the controller's internal KVS for production use.
-
-        GroupDataProviderImpl reads all group/keyset data directly from persistent storage
-        on every operation (no in-memory cache), so writing the correct TLV here is
-        sufficient to make SendGroupCommand work without restarting the controller.
-
-        Critical: the SDK stores the *derived* GroupOperationalCredentials, NOT the raw
-        epoch key.  Writing the raw key was the original bug that caused all group
-        commands to fail (keys never matched).
-        """
-        # pylint: disable=too-many-locals,too-many-statements,protected-access,broad-exception-caught
-        try:
-            # Use the PersistentStorage object defined in chip.storage
-            storage = self.server.stack._chip_stack._persistentStorage
-            fabric_idx = (
-                self._chip_device_controller._chip_controller.GetFabricIndexInternal()
-            )
-
-            # 0xFFFF = kInvalidKeysetId (keyset ID 0 is reserved for the IPK)
-            invalid_id = 0xFFFF
-
-            if group.keyset_id is not None:
-                # Already have keys generated and injected
-                return
-
-            group_key_name = f"f/{fabric_idx:x}/g/{group.group_id:x}"
-            group_info_exists = storage.GetSdkKey(group_key_name) is not None
-
-            # Generate new keyset_id and epoch_key if not present
-            if group.keyset_id is None:
-                # Use group_id as keyset_id for simplicity, avoiding 0 (IPK)
-                group.keyset_id = (group.group_id % 0xFFFE) + 1
-            if group.epoch_key_hex is None:
-                group.epoch_key_hex = secrets.token_bytes(16).hex()
-
-            # Save the updated group to our local storage
-            self.server.storage.set(DATA_KEY_GROUPS, group, subkey=str(group.group_id))
-
-            # --- Key derivation (matches GroupDataProviderImpl::SetKeySet) ---
-            # The SDK stores derived GroupOperationalCredentials, not the raw epoch key.
-            # Derive encryption_key and session_id before writing to KVS.
-            epoch_key = bytes.fromhex(group.epoch_key_hex)
-            compressed_fabric_id = self._compressed_fabric_id or 0
-            encryption_key = self._derive_group_encryption_key(
-                epoch_key, compressed_fabric_id
-            )
-            session_id = self._derive_group_session_id(encryption_key)
-            zeroed_key = bytes(16)
-
-            # 1. Update/Create FabricData
+            # --- Read current FabricData ---
             fabric_data_name = f"f/{fabric_idx:x}/g"
             fabric_data_raw = storage.GetSdkKey(fabric_data_name)
             if fabric_data_raw is None:
-                # Initialize with SDK defaults (kInvalidKeysetId/kUndefinedGroupId)
                 fabric_data = {
-                    1: tlv_uint(0),  # first_group (0 = kUndefinedGroupId)
+                    1: tlv_uint(0),  # first_group
                     2: tlv_uint(0),  # group_count
                     3: tlv_uint(0),  # first_map
                     4: tlv_uint(0),  # map_count
-                    5: tlv_uint(invalid_id),  # first_keyset (0xFFFF = kInvalidKeysetId)
+                    5: tlv_uint(invalid_id),  # first_keyset
                     6: tlv_uint(0),  # keyset_count
-                    7: tlv_uint(0),  # next fabric index (0 = kUndefinedFabricIndex)
+                    7: tlv_uint(0),  # next fabric index
                 }
             else:
                 fabric_data = TLVReader(fabric_data_raw).get()["Any"]
 
-            old_first_group = fabric_data.get(1, 0)
-            old_group_count = fabric_data.get(2, 0)
             old_first_map = fabric_data.get(3, 0)
             old_map_count = fabric_data.get(4, 0)
             old_first_keyset = fabric_data.get(5, invalid_id)
             old_keyset_count = fabric_data.get(6, 0)
 
-            # 2. Write GroupInfo if it doesn't already exist
-            # (only when it doesn't already exist, to avoid corrupting the C++-written linked list)
-            if not group_info_exists:
-                writer = TLVWriter()
-                writer.put(
-                    None,
-                    {
-                        1: group.group_name[:16],
-                        2: tlv_uint(0xFFFF),  # endpoint (0xFFFF = all)
-                        3: tlv_uint(0),  # group index (0 = kUndefinedGroupId)
-                        4: tlv_uint(old_first_group),  # next pointer
-                    },
-                )
-                storage.SetSdkKey(group_key_name, writer.encoding)
-                # Update first_group to us and bump group count
-                fabric_data[1] = tlv_uint(group.group_id)
-                fabric_data[2] = tlv_uint(old_group_count + 1)
-
-            # 3. Write Keyset (tags: 1=policy, 2=keys_count, 3=array[3], 7=next)
+            # --- Write KeySet ---
             # IMPORTANT: array must have EXACTLY 3 items (kEpochKeysMax).
-            # tag6 = DERIVED encryption key; tag5 = DERIVED session ID.
-            keyset_key_name = f"f/{fabric_idx:x}/k/{group.keyset_id:x}"
+            # Tag 6 = DERIVED encryption key; tag 5 = DERIVED session ID.
+            keyset_key_name = f"f/{fabric_idx:x}/k/{keyset_id:x}"
             writer = TLVWriter()
             writer.put(
                 None,
@@ -1683,28 +1601,26 @@ class MatterDeviceController:
                     1: tlv_uint(1),  # policy: kCacheAndSync
                     2: tlv_uint(1),  # keys_count (1 active epoch key)
                     3: [
-                        # slot 0 - our active key
                         {4: tlv_uint(0), 5: tlv_uint(session_id), 6: encryption_key},
-                        # slots 1 & 2 - unused, zeroed (required by kEpochKeysMax=3)
                         {4: tlv_uint(0), 5: tlv_uint(0), 6: zeroed_key},
                         {4: tlv_uint(0), 5: tlv_uint(0), 6: zeroed_key},
                     ],
-                    7: tlv_uint(old_first_keyset),  # next keyset in linked list
+                    7: tlv_uint(old_first_keyset),
                 },
             )
             storage.SetSdkKey(keyset_key_name, writer.encoding)
-            fabric_data[5] = tlv_uint(group.keyset_id)
+            fabric_data[5] = tlv_uint(keyset_id)
             fabric_data[6] = tlv_uint(old_keyset_count + 1)
 
-            # 4. Write Map (tags: 1=group_id, 2=keyset_id, 3=next)
+            # --- Write KeyMap (group_id → keyset_id) ---
             map_id = secrets.randbelow(50000) + 10000
             map_key_name = f"f/{fabric_idx:x}/gk/{map_id:x}"
             writer = TLVWriter()
             writer.put(
                 None,
                 {
-                    1: tlv_uint(group.group_id),
-                    2: tlv_uint(group.keyset_id),
+                    1: tlv_uint(group_id),
+                    2: tlv_uint(keyset_id),
                     3: tlv_uint(old_first_map),
                 },
             )
@@ -1712,33 +1628,39 @@ class MatterDeviceController:
             fabric_data[3] = tlv_uint(map_id)
             fabric_data[4] = tlv_uint(old_map_count + 1)
 
-            # 5. Save updated FabricData
+            # --- Save updated FabricData ---
             writer = TLVWriter()
             writer.put(None, fabric_data)
             storage.SetSdkKey(fabric_data_name, writer.encoding)
 
             LOGGER.info(
-                "Generated controller keys for group %s (keyset_id=%s)",
-                group.group_id,
-                group.keyset_id,
+                "Injected controller keys for group %s (keyset_id=%s)",
+                group_id,
+                keyset_id,
             )
         except Exception as err:  # noqa: BLE001
-            LOGGER.error("Failed to inject controller group keys: %s", err)
+            LOGGER.error(
+                "Failed to inject controller group keys for group %s: %s", group_id, err
+            )
 
-    @api_command(APICommand.ADD_GROUP)
-    def add_group(self, group_id: int, group_name: str) -> MatterGroupInfo:
-        """Add a group to the server registry."""
-        group = MatterGroupInfo(group_id=group_id, group_name=group_name)
-        self._groups[group_id] = group
-        self._ensure_controller_group_keys(group)
-        self.server.storage.set(DATA_KEY_GROUPS, group, subkey=str(group_id))
-        return group
-
-    @api_command(APICommand.REMOVE_GROUP)
-    def remove_group(self, group_id: int) -> None:
-        """Remove a group from the server registry."""
-        self._groups.pop(group_id, None)
-        self.server.storage.remove(DATA_KEY_GROUPS, subkey=str(group_id))
+    async def _endpoint_supports_groups(self, node_id: int, endpoint_id: int) -> bool:
+        """Return True if the endpoint advertises Groups cluster (id=4) in Descriptor.ServerList."""
+        try:
+            read_result = await self._chip_device_controller.read_attribute(
+                node_id=node_id,
+                attributes=[(endpoint_id, Clusters.Descriptor.Attributes.ServerList)],
+            )
+        except Exception:  # noqa: BLE001  # pylint: disable=W0718
+            return False
+        if read_result is None:
+            return False
+        try:
+            server_list = read_result.attributes[endpoint_id][Clusters.Descriptor][
+                Clusters.Descriptor.Attributes.ServerList
+            ]
+            return Clusters.Groups.id in server_list
+        except (KeyError, TypeError):
+            return False
 
     @api_command(APICommand.GROUP_SEND_COMMAND)
     async def send_group_command(
@@ -1748,31 +1670,34 @@ class MatterDeviceController:
         command_name: str,
         payload: dict[str, Any],
     ) -> None:
-        """Send a group command."""
+        """Send a command to a group using Matter multicast (groupcast).
+
+        The CHIP controller sends a single multicast frame addressed to the
+        group ID — no per-node unicast loop is performed.  The controller must
+        have the group's encryption keys in its GroupDataProvider, which are
+        injected automatically when a group is first created via group_add.
+        """
         cluster_cls: Cluster = ALL_CLUSTERS[cluster_id]
         command_cls = getattr(cluster_cls.Commands, command_name)
         command = dataclass_from_dict(command_cls, payload, allow_sdk_types=True)
         try:
             await self._chip_device_controller.send_group_command(group_id, command)
         except ChipStackError as err:
+            if err.err == 0xAC and group_id in self._group_key_store:
+                # Keys may have been orphaned (e.g. after init_group_testing_data).
+                # Re-inject from our key store and retry once.
+                keyset_id, epoch_key_hex = self._group_key_store[group_id]
+                LOGGER.info(
+                    "Re-injecting controller keys for group %s and retrying", group_id
+                )
+                self._inject_controller_group_keys(group_id, keyset_id, epoch_key_hex)
+                await self._chip_device_controller.send_group_command(group_id, command)
+                return
             if err.err == 0xAC:
-                # Controller doesn't have the keys for this group ID.
-                # In production, keys should be auto-injected by `add_group`.
-                # If they aren't, try to force inject them and retry once.
-                if group_id in self._groups:
-                    LOGGER.info(
-                        "Attempting to auto-inject missing controller keys for group %s and retrying",
-                        group_id,
-                    )
-                    self._ensure_controller_group_keys(self._groups[group_id])
-                    await self._chip_device_controller.send_group_command(
-                        group_id, command
-                    )
-                    return
                 raise InvalidArguments(
-                    f"Group command failed with 0xAC (Internal Error) for group_id {group_id}. "
-                    "The group must be created via the API before sending commands so that the "
-                    "controller can generate and store encryption keys."
+                    f"Group command failed (0xAC) for group_id {group_id}: "
+                    "no encryption keys found. Call group_add first to provision "
+                    "the controller and nodes with the required keys."
                 ) from err
             raise
 
