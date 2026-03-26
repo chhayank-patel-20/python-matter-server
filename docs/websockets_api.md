@@ -881,9 +881,9 @@ The server:
 2. Generates a random 128-bit epoch key for the group (first time only) and injects it into the controller's `GroupDataProvider`
 3. Calls `Groups.GetGroupMembership` to check the current group table and remaining capacity
 4. If the table is **full** (`remaining_capacity == 0`) and the group is not already a member, the **oldest group is removed (FIFO)** to free a slot before proceeding
-5. Reads the device's `GroupKeyManagement.GroupKeyMap` to determine which keysets are already installed
-6. Calls `GroupKeyManagement.KeySetWrite` only if the keyset is **not** already on the device (avoids redundant writes and prevents `ResourceExhausted`)
-7. If the device keyset table is full (`ResourceExhausted`), reuses a server-managed keyset already present on the device
+5. Reads the device's `GroupKeyManagement.GroupKeyMap` and the controller's keyset tracker
+6. Calls `GroupKeyManagement.KeySetWrite` to install the key on the device, **unless** the tracker confirms `KeySetWrite` was already sent **and** the binding exists in `GroupKeyMap`. A binding alone is not sufficient proof — the keyset can be lost while the binding remains (device reset, firmware update, silent write failure).
+7. If the device keyset table is full (`ResourceExhausted`), cleans up orphaned keysets first (via `KeySetRemove`) and retries. If still full, reuses a server-managed keyset that is confirmed on the device by both `GroupKeyMap` and the tracker.
 8. Updates the device's `GroupKeyMap` to bind the group ID to the keyset
 9. Sends `Groups.AddGroup` to the device endpoint
 
@@ -1094,7 +1094,7 @@ the encryption keys for that group ID.
 > There is no confirmation that individual nodes received or executed the command.
 
 **Common Errors:**
-- `CHIP Error 0xAC (Internal Error)` — The controller lacks encryption keys for this group ID. Call `group_add` first to provision the controller and nodes. If keys were orphaned (e.g. after calling `init_group_testing_data`), the server automatically re-injects them and retries once.
+- `CHIP Error 0xAC (Internal Error)` — The **controller** lacks encryption keys for this group ID in its local SDK storage (e.g. after a server restart). The server automatically re-injects the keys and retries once. **Important:** if the groupcast still has no effect after the retry (no error but device ignores it), the **device** is missing the keyset — call `group_add` again on each affected node to re-run `KeySetWrite` on the device. `SetSdkKey ≠ KeySetWrite`: re-injection only restores the controller-side key, not the device-side key.
 - `CHIP Error 0x32 (Timeout)` — A CASE session could not be established with a node (mDNS lookup failed or device is offline). This does not affect groupcast delivery to other online nodes.
 
 ---

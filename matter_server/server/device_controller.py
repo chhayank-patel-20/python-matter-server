@@ -1685,7 +1685,7 @@ class MatterDeviceController:
         except (KeyError, TypeError):
             return []
 
-    async def _provision_group_keys_on_node(  # pylint: disable=too-many-locals
+    async def _provision_group_keys_on_node(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
         self,
         node_id: int,
         group_id: int,
@@ -1697,15 +1697,19 @@ class MatterDeviceController:
         Algorithm (follows Matter Group Key Management Cluster semantics):
 
         1. Read the device's current GroupKeyMap (fabric-scoped).
-        2. If group_id is already bound to our keyset_id → fully provisioned, return early.
-        3. If keyset_id already appears in any mapping on the device → the keyset is
-           already installed; skip KeySetWrite and only update the GroupKeyMap entry.
+        2. If group_id is already bound to our keyset_id AND the controller tracker
+           confirms the keyset was actually written → fully provisioned, return early.
+           (GroupKeyMap alone is NOT sufficient — the binding can outlive the keyset
+           itself, e.g. after a device reset or silent KeySetWrite failure.)
+        3. If the controller tracker confirms the keyset was written AND it is referenced
+           by any current GroupKeyMap entry → keyset is installed; skip KeySetWrite and
+           only update the GroupKeyMap binding.
         4. Otherwise write the keyset via KeySetWrite, then update GroupKeyMap.
         5. On ResourceExhausted (0x89):
            a. Run _cleanup_unused_keysets_on_node to remove orphaned keysets.
            b. Re-read device state and retry KeySetWrite if any slot was freed.
-           c. If still full, find a keyset that is (a) already on the device and
-              (b) known to the server.  Reuse it.  Raises InvalidArguments if
+           c. If still full, find a keyset that is (a) referenced in GroupKeyMap and
+              (b) tracked by the controller.  Reuse it.  Raises InvalidArguments if
               no reusable keyset can be found.
         """
         # 1. Read current device GroupKeyMap.
@@ -1714,26 +1718,48 @@ class MatterDeviceController:
             e.groupId: e.groupKeySetID for e in entries
         }
         device_keyset_ids: set[int] = set(existing_bindings.values())
+        tracked_keysets: set[int] = set(
+            self._known_keysets_per_node.get(node_id, set())
+        )
 
-        # 2. Already fully provisioned for this group with our keyset.
-        if existing_bindings.get(group_id) == keyset_id:
+        # 2. Fully provisioned: binding exists AND tracker confirms KeySetWrite was sent.
+        #    GroupKeyMap binding alone is NOT proof — the keyset can be lost while the
+        #    binding remains (device reset, firmware update, silent write failure).
+        if (
+            existing_bindings.get(group_id) == keyset_id
+            and keyset_id in tracked_keysets
+        ):
             LOGGER.debug(
                 "Group %s already provisioned on node %s with keyset_id %s",
                 group_id,
                 node_id,
                 keyset_id,
             )
-            # We know the keyset is on the device — make sure the tracker reflects this.
-            self._record_keyset_on_node(node_id, keyset_id)
             return
 
-        # 3 & 4. Write keyset only if it is not already installed on the device.
+        if (
+            existing_bindings.get(group_id) == keyset_id
+            and keyset_id not in tracked_keysets
+        ):
+            LOGGER.info(
+                "GroupKeyMap binding exists for group %s on node %s (keyset_id=%s) "
+                "but keyset not in controller tracker — forcing KeySetWrite to ensure "
+                "device has the key",
+                group_id,
+                node_id,
+                keyset_id,
+            )
+            # Fall through to (re-)write the keyset.
+
+        # 3 & 4. Write keyset.
+        #    Skip only when tracker confirms the keyset is installed AND it is referenced
+        #    by a current GroupKeyMap entry (i.e., it hasn't been orphaned).
         actual_keyset_id = keyset_id
         actual_epoch_key_hex = epoch_key_hex
 
-        if keyset_id in device_keyset_ids:
-            # Keyset already on device — just record it in the tracker.
-            self._record_keyset_on_node(node_id, keyset_id)
+        if keyset_id in device_keyset_ids and keyset_id in tracked_keysets:
+            # Tracker + GroupKeyMap agree: keyset is on device. Skip write.
+            pass
         else:
             write_error: InteractionModelError | None = None
             try:
@@ -1765,7 +1791,11 @@ class MatterDeviceController:
                 device_keyset_ids = set(existing_bindings.values())
 
                 our_keyset_map: dict[int, str] = dict(self._group_key_store.values())
-                reusable = set(our_keyset_map.keys()) & device_keyset_ids
+                # Reuse only keysets that: (a) server knows the epoch key for,
+                # (b) are referenced in GroupKeyMap (device has them), AND
+                # (c) tracker confirms they were written (not just bound).
+                tracked_now = set(self._known_keysets_per_node.get(node_id, set()))
+                reusable = set(our_keyset_map.keys()) & device_keyset_ids & tracked_now
                 if not reusable:
                     raise InvalidArguments(
                         f"Cannot provision group {group_id} on node {node_id}: "
@@ -2120,11 +2150,21 @@ class MatterDeviceController:
             await self._chip_device_controller.send_group_command(group_id, command)
         except ChipStackError as err:
             if err.err == 0xAC and group_id in self._group_key_store:
-                # Keys may have been orphaned (e.g. after init_group_testing_data).
-                # Re-inject from our key store and retry once.
+                # 0xAC is a CONTROLLER-SIDE error: the CHIP SDK cannot find the
+                # encryption key in its local GroupDataProvider (e.g. after a server
+                # restart before the KVS was re-populated).
+                # Fix: re-inject into the controller's local SDK storage and retry.
+                # NOTE: this fixes the controller side only. If the device is also
+                # missing the keyset (e.g. after a factory reset), the multicast will
+                # be sent successfully from the controller's perspective but silently
+                # dropped by the device. In that case, call group_add again on each
+                # affected node to re-run KeySetWrite on the device.
                 keyset_id, epoch_key_hex = self._group_key_store[group_id]
                 LOGGER.info(
-                    "Re-injecting controller keys for group %s and retrying", group_id
+                    "Controller lost keys for group %s (0xAC) — re-injecting into "
+                    "local SDK storage and retrying. If groupcast still has no effect, "
+                    "the device may be missing the keyset — call group_add to re-provision.",
+                    group_id,
                 )
                 self._inject_controller_group_keys(group_id, keyset_id, epoch_key_hex)
                 await self._chip_device_controller.send_group_command(group_id, command)

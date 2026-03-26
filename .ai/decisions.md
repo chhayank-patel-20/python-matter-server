@@ -217,3 +217,21 @@ The previous TLV injection stored the raw epoch key as `TagKeyValue` (tag 6) and
 ### 3. `group_debug_info` command
 - **Decision**: Added `group_debug_info(node_id)` API command returning `{group_key_map, controller_tracked_keysets, inferred_orphaned_keysets, group_key_store_entries}`. All data is derived from live device reads + server state — no extra storage.
 - **Rationale**: Groupcast failures on consumer devices are hard to diagnose without visibility into the device's key map vs the controller's state. This command gives the frontend (and developers) a single-call dump of all relevant group key state.
+
+## 2026-03-26: Fix False "Already Provisioned" Confidence
+
+### 1. GroupKeyMap binding ≠ keyset installed (critical distinction)
+- **Decision**: `_provision_group_keys_on_node` now requires BOTH a GroupKeyMap binding AND a controller tracker entry to skip `KeySetWrite`. GroupKeyMap alone is no longer sufficient for the early return or the skip-write check.
+- **Rationale**: The GroupKeyMap binding (`group_id → keyset_id`) survives device resets, firmware updates, and silent `KeySetWrite` failures — but the actual keyset data does not. Using the binding as proof of a live keyset causes `group_add` to return "already provisioned" while the device cannot decrypt any groupcast (silent drop). The controller tracker (`_known_keysets_per_node`) is the only record that `KeySetWrite` was actually sent.
+
+### 2. Force KeySetWrite when tracker is absent (handles old nodes)
+- **Decision**: When a GroupKeyMap binding exists but the tracker has no entry for that node+keyset, the code logs an INFO-level message and falls through to a forced `KeySetWrite` instead of returning early.
+- **Rationale**: Nodes added before the tracker was implemented have no tracker entries. Without this fallback, they would be permanently stuck in "already provisioned" state with silently failing groupcast.
+
+### 3. ResourceExhausted reuse requires tracker confirmation
+- **Decision**: The fallback keyset reuse path (`reusable = our_keyset_map.keys() & device_keyset_ids & tracked_now`) now intersects with `tracked_keysets` in addition to `device_keyset_ids`.
+- **Rationale**: Reusing a keyset where the tracker has no record means we cannot be confident the device has it. Without tracker confirmation, groupcast for the remapped group would also fail silently.
+
+### 4. SetSdkKey ≠ KeySetWrite (documented distinction)
+- **Decision**: The `send_group_command` 0xAC retry path now logs a clear warning explaining that re-injection is controller-local only, and instructs callers to run `group_add` if the device continues to ignore commands.
+- **Rationale**: `_inject_controller_group_keys` calls `SetSdkKey` — this writes to the CHIP controller's local GroupDataProvider (chip.json KVS), restoring the controller's ability to encrypt multicast frames. It does NOT send `KeySetWrite` to the device. If the device lost its keyset (factory reset, etc.), the multicast is sent but silently dropped. This distinction was a source of confusion and is now explicitly documented in both logs and API docs.

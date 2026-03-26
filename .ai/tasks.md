@@ -34,6 +34,10 @@
 - [x] Add controller-side keyset tracker (`_known_keysets_per_node`, persisted as `node_keysets`): records every `KeySetWrite` and confirmed keyset presence; used as fallback source for cleanup when device does not expose `GroupKeyTable` (e.g. Tapo).
 - [x] Fix `_cleanup_unused_keysets_on_node` fallback: if `GroupKeyTable` read fails/empty, use `_known_keysets_per_node` as the keyset source; update tracker on each `KeySetRemove`.
 - [x] Add `group_debug_info` API command: returns live `GroupKeyMap`, controller-tracked keysets, inferred orphaned keysets, and group key store entries for a node.
+- [x] Fix false "already provisioned" early return in `_provision_group_keys_on_node`: GroupKeyMap binding alone ≠ keyset installed on device. Now requires BOTH binding AND controller tracker confirmation before skipping `KeySetWrite`. Forces re-provision when tracker is missing (old nodes, server restart, silent write failure).
+- [x] Fix unsafe KeySetWrite skip: keyset referenced in GroupKeyMap but not in tracker now forces a re-write.
+- [x] Fix ResourceExhausted fallback reuse: only reuse keysets confirmed by both GroupKeyMap AND tracker.
+- [x] Fix `send_group_command` 0xAC comment: clarify that re-injection is controller-side only (SetSdkKey ≠ KeySetWrite). Log warning to call `group_add` if device ignores the command after retry.
 
 ## Backlog
 - [ ] Add `discover` command to `scripts/cli_client.py`.
