@@ -62,6 +62,8 @@ class APICommand(StrEnum):
     BINDING_REMOVE = "binding_remove"
     GROUP_ADD = "group_add"
     GROUP_REMOVE = "group_remove"
+    GROUP_REMOVE_ALL = "group_remove_all"
+    GROUP_LIST = "group_list"
     GROUP_GET_MEMBERSHIP = "group_get_membership"
     GROUP_SEND_COMMAND = "group_send_command"
     GROUP_ADD_KEY_SET = "group_add_key_set"
@@ -260,6 +262,24 @@ class BLEScanResult:
     matter_discriminator: int | None  # Decoded from fff6 service data
     matter_vendor_id: int | None  # Decoded from fff6 service data
     matter_product_id: int | None  # Decoded from fff6 service data
+
+
+@dataclass
+class MatterGroupInfo:
+    """Single group entry returned by the group_list command."""
+
+    group_id: int
+    group_name: str | None
+
+
+@dataclass
+class GroupListResult:
+    """Result returned by the group_list command."""
+
+    node_id: int
+    endpoint: int
+    remaining_capacity: int | None  # None means the device reported unknown capacity
+    groups: list[MatterGroupInfo]
 
 
 class UpdateSource(Enum):

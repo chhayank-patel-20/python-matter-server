@@ -74,7 +74,9 @@ from ..common.helpers.util import (
 from ..common.models import (
     APICommand,
     EventType,
+    GroupListResult,
     MatterFabricInfo,
+    MatterGroupInfo,
     MatterNodeData,
     MatterNodeEvent,
     NodePingResult,
@@ -1465,7 +1467,35 @@ class MatterDeviceController:
 
         keyset_id, epoch_key_hex = self._group_key_store[group_id]
 
-        # 4. Provision the node (reads device state first, reuses keysets where
+        # 4. Check device group-table capacity before provisioning keys.
+        #    If the group is already a member we can skip this (AddGroup is idempotent).
+        existing_groups, remaining_cap = await self._get_group_membership_and_capacity(
+            node_id, endpoint
+        )
+        if group_id not in existing_groups and remaining_cap == 0:
+            # Table is full — evict the oldest group (FIFO) to free a slot.
+            if existing_groups:
+                evict_id = existing_groups[0]
+                LOGGER.info(
+                    "Group table full on node %s endpoint %s — evicting group %s (FIFO) "
+                    "to make room for group %s",
+                    node_id,
+                    endpoint,
+                    evict_id,
+                    group_id,
+                )
+                await self._chip_device_controller.send_command(
+                    node_id,
+                    endpoint,
+                    Clusters.Groups.Commands.RemoveGroup(groupID=evict_id),
+                )
+            else:
+                raise InvalidArguments(
+                    f"Cannot add group {group_id} on node {node_id} endpoint {endpoint}: "
+                    "group table is reported as full but no existing groups were returned."
+                )
+
+        # 5. Provision the node (reads device state first, reuses keysets where
         #    possible, handles ResourceExhausted gracefully).
         try:
             await self._provision_group_keys_on_node(
@@ -1479,13 +1509,33 @@ class MatterDeviceController:
                 err,
             )
 
-        # 5. Send Groups.AddGroup to the device (Matter spec §11.2.6.1).
+        # 6. Send Groups.AddGroup to the device (Matter spec §11.2.6.1).
         await self._chip_device_controller.send_command(
             node_id,
             endpoint,
             Clusters.Groups.Commands.AddGroup(groupID=group_id, groupName=group_name),
             timed_request_timeout_ms=5000,
         )
+
+    async def _get_group_membership_and_capacity(
+        self, node_id: int, endpoint: int
+    ) -> tuple[list[int], int | None]:
+        """Return (group_ids, remaining_capacity) from Groups.GetGroupMembership.
+
+        Queries the device via the Groups cluster.  remaining_capacity is None when
+        the device reports an unknown/null capacity value.
+        """
+        resp = await self._chip_device_controller.send_command(
+            node_id,
+            endpoint,
+            Clusters.Groups.Commands.GetGroupMembership(groupList=[]),
+        )
+        group_ids: list[int] = list(resp.groupList)
+        raw_cap = resp.capacity
+        # The Matter spec uses nullable uint8 for capacity; the SDK may return None
+        # or a Null sentinel.  Treat anything that is not a plain int as unknown.
+        remaining: int | None = raw_cap if isinstance(raw_cap, int) else None
+        return group_ids, remaining
 
     async def _get_node_group_key_map(
         self, node_id: int
@@ -1646,6 +1696,49 @@ class MatterDeviceController:
             node_id,
             endpoint,
             Clusters.Groups.Commands.RemoveGroup(groupID=group_id),
+        )
+
+    @api_command(APICommand.GROUP_REMOVE_ALL)
+    async def group_remove_all(self, node_id: int, endpoint: int) -> None:
+        """Remove all groups from a node endpoint."""
+        await self._chip_device_controller.send_command(
+            node_id,
+            endpoint,
+            Clusters.Groups.Commands.RemoveAllGroups(),
+        )
+
+    @api_command(APICommand.GROUP_LIST)
+    async def group_list(self, node_id: int, endpoint: int) -> GroupListResult:
+        """Return all groups an endpoint belongs to, with names and remaining capacity.
+
+        Calls GetGroupMembership (for IDs + remaining capacity) and ViewGroup (for
+        each name).  The device is queried live — no server-side cache is used.
+        """
+        group_ids, remaining_cap = await self._get_group_membership_and_capacity(
+            node_id, endpoint
+        )
+
+        groups: list[MatterGroupInfo] = []
+        for gid in group_ids:
+            name: str | None = None
+            try:
+                view_resp = await self._chip_device_controller.send_command(
+                    node_id,
+                    endpoint,
+                    Clusters.Groups.Commands.ViewGroup(groupID=gid),
+                )
+                # status 0 = SUCCESS in the Groups cluster
+                if int(view_resp.status) == 0:
+                    name = view_resp.groupName or None
+            except Exception:  # noqa: BLE001, S110  # pylint: disable=W0718
+                pass  # name stays None if ViewGroup fails — not fatal
+            groups.append(MatterGroupInfo(group_id=gid, group_name=name))
+
+        return GroupListResult(
+            node_id=node_id,
+            endpoint=endpoint,
+            remaining_capacity=remaining_cap,
+            groups=groups,
         )
 
     @api_command(APICommand.GROUP_GET_MEMBERSHIP)

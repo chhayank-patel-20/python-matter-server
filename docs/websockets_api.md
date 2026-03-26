@@ -873,11 +873,13 @@ is queried directly from the device with `group_get_membership`.
 The server:
 1. Validates the endpoint supports the Groups cluster via `Descriptor.ServerList`
 2. Generates a random 128-bit epoch key for the group (first time only) and injects it into the controller's `GroupDataProvider`
-3. Reads the device's `GroupKeyManagement.GroupKeyMap` to determine which keysets are already installed
-4. Calls `GroupKeyManagement.KeySetWrite` only if the keyset is **not** already on the device (avoids redundant writes and prevents `ResourceExhausted`)
-5. If the device keyset table is full (`ResourceExhausted`), reuses a server-managed keyset already present on the device
-6. Updates the device's `GroupKeyMap` to bind the group ID to the keyset
-7. Sends `Groups.AddGroup` to the device endpoint
+3. Calls `Groups.GetGroupMembership` to check the current group table and remaining capacity
+4. If the table is **full** (`remaining_capacity == 0`) and the group is not already a member, the **oldest group is removed (FIFO)** to free a slot before proceeding
+5. Reads the device's `GroupKeyManagement.GroupKeyMap` to determine which keysets are already installed
+6. Calls `GroupKeyManagement.KeySetWrite` only if the keyset is **not** already on the device (avoids redundant writes and prevents `ResourceExhausted`)
+7. If the device keyset table is full (`ResourceExhausted`), reuses a server-managed keyset already present on the device
+8. Updates the device's `GroupKeyMap` to bind the group ID to the keyset
+9. Sends `Groups.AddGroup` to the device endpoint
 
 Call this once per endpoint/node you want to add to the group. Group membership is stored
 on the device — not on the server.
@@ -906,9 +908,12 @@ on the device — not on the server.
 
 **Errors:**
 - `InvalidArguments` — endpoint does not support the Groups cluster
-- `InvalidArguments` — device keyset table is full **and** no server-managed keyset is already installed on the device. Remove unused group memberships on the device first, then retry.
+- `InvalidArguments` — group table is reported full but `GetGroupMembership` returned no existing groups (device in unexpected state)
+- `InvalidArguments` — device keyset table is full **and** no server-managed keyset is already installed on the device; use `group_remove` or `group_remove_all` to free slots first
 
-> **Note on keyset reuse:** Devices typically support only 3 group keysets. `group_add` automatically reuses keysets across multiple groups when possible, so you can add more groups than the keyset limit. You only hit the error above in the rare case where the table is completely occupied by keysets the server did not create (e.g. keysets installed by another controller).
+> **Automatic FIFO eviction:** If `GetGroupMembership` reports `remaining_capacity == 0`, `group_add` automatically removes the oldest group on that endpoint (the first entry in the membership list) before adding the new one. Use `group_list` first if you want to choose which group to remove manually.
+>
+> **Keyset reuse:** Devices typically support only 3 group keysets. `group_add` reuses existing keysets across multiple groups, so you can manage more groups than the keyset limit allows.
 
 **Typical workflow:**
 ```
@@ -937,6 +942,80 @@ Sends `Groups.RemoveGroup` to the device endpoint.
 ```
 
 **Response:** `{ "message_id": "1", "result": null }`
+
+---
+
+**`group_remove_all`** — Remove all groups from a node endpoint
+
+Sends `Groups.RemoveAllGroups` to the device endpoint. Useful for clearing a full group table before re-adding groups.
+
+```json
+{
+  "message_id": "1",
+  "command": "group_remove_all",
+  "args": {
+    "node_id": 1,
+    "endpoint": 1
+  }
+}
+```
+
+**Response:** `{ "message_id": "1", "result": null }`
+
+---
+
+**`group_list`** — List all groups on a node endpoint with names and remaining capacity
+
+Calls `Groups.GetGroupMembership` (for IDs and remaining capacity) then `Groups.ViewGroup` for each group to fetch its name. All data comes from the device — no server-side cache is used.
+
+```json
+{
+  "message_id": "1",
+  "command": "group_list",
+  "args": {
+    "node_id": 1,
+    "endpoint": 1
+  }
+}
+```
+
+| Arg | Required | Description |
+|---|---|---|
+| `node_id` | Yes | Target node |
+| `endpoint` | Yes | Target endpoint |
+
+**Response:**
+```json
+{
+  "message_id": "1",
+  "result": {
+    "node_id": 1,
+    "endpoint": 1,
+    "remaining_capacity": 2,
+    "groups": [
+      { "group_id": 100, "group_name": "Living Room Lights" },
+      { "group_id": 200, "group_name": "Kitchen" }
+    ]
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `node_id` | int | Node ID echoed from request |
+| `endpoint` | int | Endpoint echoed from request |
+| `remaining_capacity` | int \| null | How many more groups can be added on this endpoint. `null` means the device did not report a capacity. |
+| `groups` | array | List of group objects currently bound to this endpoint |
+| `groups[].group_id` | int | Group ID |
+| `groups[].group_name` | str \| null | Name stored on device. `null` if `ViewGroup` failed or returned no name. |
+
+> **Typical UI workflow:**
+> ```
+> group_list(node_id=1, endpoint=1)
+> → show groups + remaining_capacity to user
+> → user picks a group to delete → group_remove(...)
+> → user adds a new group → group_add(...)
+> ```
 
 ---
 
