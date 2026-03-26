@@ -1766,145 +1766,101 @@ class MatterDeviceController:
         Algorithm (follows Matter Group Key Management Cluster semantics):
 
         1. Read the device's current GroupKeyMap (fabric-scoped).
-        2. If group_id is already bound to our keyset_id AND the controller tracker
-           confirms the keyset was actually written → fully provisioned, return early.
-           (GroupKeyMap alone is NOT sufficient — the binding can outlive the keyset
-           itself, e.g. after a device reset or silent KeySetWrite failure.)
-        3. If the controller tracker confirms the keyset was written AND it is referenced
-           by any current GroupKeyMap entry → keyset is installed; skip KeySetWrite and
-           only update the GroupKeyMap binding.
-        4. Otherwise write the keyset via KeySetWrite, then update GroupKeyMap.
-        5. On ResourceExhausted (0x89):
+        2. Always write the keyset via KeySetWrite — it is idempotent per Matter spec
+           §11.2.7.1.1 (device overwrites in-place if already present).  Do NOT skip
+           based on _known_keysets_per_node: that tracker reflects what the controller
+           sent, not what the device still has.  After a device reboot or factory reset
+           the tracker is stale and would cause a silent groupcast drop.
+        3. On ResourceExhausted (0x89):
            a. Run _cleanup_unused_keysets_on_node to remove orphaned keysets.
-           b. Re-read device state and retry KeySetWrite if any slot was freed.
-           c. If still full, find a keyset that is (a) referenced in GroupKeyMap and
-              (b) tracked by the controller.  Reuse it.  Raises InvalidArguments if
-              no reusable keyset can be found.
+           b. Retry KeySetWrite if any slot was freed.
+           c. If still full, reuse a server-managed keyset already on the device.
+              Raises InvalidArguments if no reusable keyset can be found.
+        4. Update the GroupKeyMap binding (group_id → keyset_id).
         """
         # 1. Read current device GroupKeyMap.
         entries = await self._get_node_group_key_map(node_id)
         existing_bindings: dict[int, int] = {
             e.groupId: e.groupKeySetID for e in entries
         }
-        device_keyset_ids: set[int] = set(existing_bindings.values())
-        tracked_keysets: set[int] = set(
-            self._known_keysets_per_node.get(node_id, set())
-        )
 
-        # 2. Fully provisioned: binding exists AND tracker confirms KeySetWrite was sent.
-        #    GroupKeyMap binding alone is NOT proof — the keyset can be lost while the
-        #    binding remains (device reset, firmware update, silent write failure).
-        if (
-            existing_bindings.get(group_id) == keyset_id
-            and keyset_id in tracked_keysets
-        ):
-            LOGGER.debug(
-                "Group %s already provisioned on node %s with keyset_id %s",
-                group_id,
-                node_id,
-                keyset_id,
-            )
-            return
-
-        if (
-            existing_bindings.get(group_id) == keyset_id
-            and keyset_id not in tracked_keysets
-        ):
-            LOGGER.info(
-                "GroupKeyMap binding exists for group %s on node %s (keyset_id=%s) "
-                "but keyset not in controller tracker — forcing KeySetWrite to ensure "
-                "device has the key",
-                group_id,
-                node_id,
-                keyset_id,
-            )
-            # Fall through to (re-)write the keyset.
-
-        # 3 & 4. Write keyset.
-        #    Skip only when tracker confirms the keyset is installed AND it is referenced
-        #    by a current GroupKeyMap entry (i.e., it hasn't been orphaned).
         actual_keyset_id = keyset_id
         actual_epoch_key_hex = epoch_key_hex
 
-        if keyset_id in device_keyset_ids and keyset_id in tracked_keysets:
-            # Tracker + GroupKeyMap agree: keyset is on device. Skip write.
-            pass
-        else:
-            write_error: InteractionModelError | None = None
-            try:
-                await self.group_add_key_set(node_id, keyset_id, epoch_key_hex)
-            except InteractionModelError as err:
-                if not self._is_resource_exhausted_err(err):
-                    raise
-                write_error = err
+        # 2. Always send KeySetWrite — idempotent, ensures device has the key.
+        write_error: InteractionModelError | None = None
+        try:
+            await self.group_add_key_set(node_id, keyset_id, epoch_key_hex)
+        except InteractionModelError as err:
+            if not self._is_resource_exhausted_err(err):
+                raise
+            write_error = err
 
-            if write_error is not None:
-                # 5a. ResourceExhausted — try removing orphaned keysets first.
-                cleaned = await self._cleanup_unused_keysets_on_node(node_id)
-                if cleaned > 0:
-                    # Slots freed — retry the write.
-                    try:
-                        await self.group_add_key_set(node_id, keyset_id, epoch_key_hex)
-                        write_error = None  # retry succeeded
-                    except InteractionModelError as retry_err:
-                        if not self._is_resource_exhausted_err(retry_err):
-                            raise
-                        write_error = retry_err
+        if write_error is not None:
+            # 3a. ResourceExhausted — try removing orphaned keysets first.
+            cleaned = await self._cleanup_unused_keysets_on_node(node_id)
+            if cleaned > 0:
+                # Slots freed — retry the write.
+                try:
+                    await self.group_add_key_set(node_id, keyset_id, epoch_key_hex)
+                    write_error = None  # retry succeeded
+                except InteractionModelError as retry_err:
+                    if not self._is_resource_exhausted_err(retry_err):
+                        raise
+                    write_error = retry_err
 
-            if write_error is not None:
-                # 5b. Still full after cleanup — re-read state (may have changed
-                #     during cleanup) and fall back to reusing a server-managed
-                #     keyset that is already installed on the device.
-                entries = await self._get_node_group_key_map(node_id)
-                existing_bindings = {e.groupId: e.groupKeySetID for e in entries}
-                device_keyset_ids = set(existing_bindings.values())
+        if write_error is not None:
+            # 3b. Still full after cleanup — re-read state (may have changed
+            #     during cleanup) and fall back to reusing a server-managed
+            #     keyset that is already installed on the device.
+            entries = await self._get_node_group_key_map(node_id)
+            existing_bindings = {e.groupId: e.groupKeySetID for e in entries}
+            device_keyset_ids: set[int] = set(existing_bindings.values())
 
-                our_keyset_map: dict[int, str] = dict(self._group_key_store.values())
-                # Reuse only keysets that: (a) server knows the epoch key for,
-                # (b) are referenced in GroupKeyMap (device has them), AND
-                # (c) tracker confirms they were written (not just bound).
-                tracked_now = set(self._known_keysets_per_node.get(node_id, set()))
-                reusable = set(our_keyset_map.keys()) & device_keyset_ids & tracked_now
-                if not reusable:
-                    raise InvalidArguments(
-                        f"Cannot provision group {group_id} on node {node_id}: "
-                        "device keyset table is full and no server-managed keyset "
-                        "is installed on this device. Remove unused group memberships "
-                        "or keysets on the device before adding more groups."
-                    ) from write_error
+            our_keyset_map: dict[int, str] = dict(self._group_key_store.values())
+            # Reuse a keyset that: (a) server knows the epoch key for, AND
+            # (b) is referenced in GroupKeyMap (so device has the slot).
+            reusable = set(our_keyset_map.keys()) & device_keyset_ids
+            if not reusable:
+                raise InvalidArguments(
+                    f"Cannot provision group {group_id} on node {node_id}: "
+                    "device keyset table is full and no server-managed keyset "
+                    "is installed on this device. Remove unused group memberships "
+                    "or keysets on the device before adding more groups."
+                ) from write_error
 
-                # Pick the lowest reusable keyset_id (stable, deterministic).
-                actual_keyset_id = min(reusable)
-                actual_epoch_key_hex = our_keyset_map[actual_keyset_id]
-                LOGGER.warning(
-                    "Node %s keyset table full — reusing keyset_id %s for group %s",
-                    node_id,
-                    actual_keyset_id,
-                    group_id,
-                )
-                # We confirmed this keyset is on the device — record it in the tracker.
-                self._record_keyset_on_node(node_id, actual_keyset_id)
+            # Pick the lowest reusable keyset_id (stable, deterministic).
+            actual_keyset_id = min(reusable)
+            actual_epoch_key_hex = our_keyset_map[actual_keyset_id]
+            LOGGER.warning(
+                "Node %s keyset table full — reusing keyset_id %s for group %s",
+                node_id,
+                actual_keyset_id,
+                group_id,
+            )
+            # We confirmed this keyset is on the device — record it in the tracker.
+            self._record_keyset_on_node(node_id, actual_keyset_id)
 
-                # Persist the remapped keyset so future provisioning uses the same one.
-                if self._group_key_store.get(group_id) != (
+            # Persist the remapped keyset so future provisioning uses the same one.
+            if self._group_key_store.get(group_id) != (
+                actual_keyset_id,
+                actual_epoch_key_hex,
+            ):
+                self._group_key_store[group_id] = (
                     actual_keyset_id,
                     actual_epoch_key_hex,
-                ):
-                    self._group_key_store[group_id] = (
-                        actual_keyset_id,
-                        actual_epoch_key_hex,
-                    )
-                    self.server.storage.set(
-                        DATA_KEY_GROUP_KEYS,
-                        {
-                            "keyset_id": actual_keyset_id,
-                            "epoch_key_hex": actual_epoch_key_hex,
-                        },
-                        subkey=str(group_id),
-                    )
-                    self._inject_controller_group_keys(
-                        group_id, actual_keyset_id, actual_epoch_key_hex
-                    )
+                )
+                self.server.storage.set(
+                    DATA_KEY_GROUP_KEYS,
+                    {
+                        "keyset_id": actual_keyset_id,
+                        "epoch_key_hex": actual_epoch_key_hex,
+                    },
+                    subkey=str(group_id),
+                )
+                self._inject_controller_group_keys(
+                    group_id, actual_keyset_id, actual_epoch_key_hex
+                )
 
         # Update GroupKeyMap: bind group_id → actual_keyset_id.
         # Re-read first to get the freshest view (keyset write may have triggered changes).

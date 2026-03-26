@@ -42,6 +42,7 @@
 - [x] Fix send_group_command operational fragility: replaced tracker-conditional skip with always-call `_ensure_keyset_on_node` (unconditional `KeySetWrite`). `KeySetWrite` is idempotent — device overwrites in-place if keyset exists. Eliminates silent drops after device reboot/reset where `_known_keysets_per_node` drifted from device truth.
 - [x] Add tier-3 brute-force fallback to `_cleanup_unused_keysets_on_node`: when GroupKeyTable is unavailable AND tracker is empty, iterate keyset IDs 1-31 and call `KeySetRemove` on each. NOT_FOUND errors are suppressed. Prevents permanent keyset leaks on fully constrained devices (e.g. Tapo). Cleanup is now guaranteed to run regardless of device introspection capability.
 - [x] Cleanup polish: add 300 ms sync barrier in `group_remove_all` before cleanup (device state race), widen brute-force range to 1-63 (sparse IDs on real devices), elevate tier logs to INFO for runtime visibility.
+- [x] Remove tracker-based KeySetWrite skip in `_provision_group_keys_on_node`: deleted the "fully provisioned" early return and the `device_keyset_ids & tracked_keysets` skip guard. KeySetWrite now always runs (idempotent per Matter spec §11.2.7.1.1). Aligns `group_add` with the already-correct `_ensure_keyset_on_node` pattern used in `send_group_command`. Reuse fallback now only requires GroupKeyMap confirmation (tracker check removed — tracker is controller assumption, not device truth).
 
 ## Backlog
 - [ ] Add `discover` command to `scripts/cli_client.py`.

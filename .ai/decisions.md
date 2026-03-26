@@ -281,3 +281,21 @@ The previous TLV injection stored the raw epoch key as `TagKeyValue` (tag 6) and
 ### 3. Tier 1 / Tier 2 logs elevated from DEBUG to INFO
 - **Decision**: Both `"using Tier-1 (GroupKeyTable)"` and `"using Tier-2 (controller tracker)"` log at INFO level with the discovered keyset IDs.
 - **Rationale**: Cleanup tier selection is operationally significant. Debug logs are invisible in default deployments, so issues with cleanup strategy (e.g. always falling through to brute-force) go unnoticed. INFO-level logs surface this in production without requiring debug mode.
+
+## 2026-03-26: Remove Tracker-Based KeySetWrite Skips in _provision_group_keys_on_node
+
+### 1. "Fully provisioned" early return removed
+- **Decision**: Deleted the block that returned early when `GroupKeyMap` binding existed AND `_known_keysets_per_node` tracker confirmed the keyset. `KeySetWrite` now always executes.
+- **Rationale**: The tracker records what the controller *sent*, not what the device *still has*. After a device reboot or factory reset the tracker is stale — it shows the keyset as present while the device has lost it. `group_add` would skip `KeySetWrite`, the device would never receive the key, and groupcast would silently drop. This is the identical mistake previously fixed in `send_group_command` (via `_ensure_keyset_on_node`).
+
+### 2. Skip-write guard removed
+- **Decision**: Deleted `if keyset_id in device_keyset_ids and keyset_id in tracked_keysets: pass else: ...`. The write block now executes unconditionally.
+- **Rationale**: Same root cause. `device_keyset_ids` comes from `GroupKeyMap`, not `GroupKeyTable` — it only proves a *binding* exists, not that the keyset data is installed. Combined with the stale tracker, this double-check gave false confidence and skipped writes to devices that had lost their keyset.
+
+### 3. Reuse fallback simplified
+- **Decision**: Removed the tracker requirement from the reuse fallback (`reusable = our_keyset_map.keys() & device_keyset_ids & tracked_now` → `reusable = our_keyset_map.keys() & device_keyset_ids`). Reuse now only requires that the server knows the epoch key AND it is referenced in GroupKeyMap (device has the slot occupied).
+- **Rationale**: In the ResourceExhausted path we have already confirmed the device's keyset table is full. The only reliable signal that a keyset exists on the device at this point is that `GroupKeyMap` references it (the slot is occupied). Requiring the tracker as well would incorrectly exclude reusable keysets on nodes where the tracker was never populated (e.g. first-time provisioning after server restart, or nodes provisioned before the tracker feature was added).
+
+### 4. `tracked_keysets` variable removed
+- **Decision**: Deleted `tracked_keysets = set(self._known_keysets_per_node.get(node_id, set()))` from `_provision_group_keys_on_node`.
+- **Rationale**: The variable was only referenced in the two removed skip conditions. Removing it prevents ruff from flagging an unused variable.
