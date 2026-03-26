@@ -1591,8 +1591,10 @@ class MatterDeviceController:
 
     # Safe keyset ID range for brute-force cleanup.
     # Matter keyset IDs are uint16; 0 is the IPK (never removed).
-    # Real devices typically have 3 slots; 1-31 covers all practical cases.
-    _BRUTE_FORCE_KEYSET_RANGE: range = range(1, 32)
+    # Real devices typically have 3 slots but IDs can be sparse; 1-63 covers
+    # all practical cases while staying well within 16-bit range.
+    # Devices safely return NOT_FOUND for IDs that do not exist.
+    _BRUTE_FORCE_KEYSET_RANGE: range = range(1, 64)
 
     async def _cleanup_unused_keysets_on_node(self, node_id: int) -> int:
         """Remove keysets on node that are no longer referenced by any group.
@@ -1646,10 +1648,11 @@ class MatterDeviceController:
                         Clusters.GroupKeyManagement.Attributes.GroupKeyTable  # pylint: disable=no-member
                     ]
                 }
-                LOGGER.debug(
-                    "Tier-1 (GroupKeyTable) keyset IDs on node %s: %s",
+                LOGGER.info(
+                    "Keyset cleanup on node %s: using Tier-1 (GroupKeyTable) — "
+                    "found keyset IDs %s",
                     node_id,
-                    all_keyset_ids,
+                    sorted(all_keyset_ids),
                 )
         except Exception:  # noqa: BLE001, S110  # pylint: disable=W0718
             pass  # GroupKeyTable unavailable — try tier 2
@@ -1659,10 +1662,11 @@ class MatterDeviceController:
             tracked = set(self._known_keysets_per_node.get(node_id, set()))
             if tracked:
                 all_keyset_ids = tracked
-                LOGGER.debug(
-                    "Tier-2 (controller tracker) keyset IDs on node %s: %s",
+                LOGGER.info(
+                    "Keyset cleanup on node %s: using Tier-2 (controller tracker) — "
+                    "found keyset IDs %s",
                     node_id,
-                    all_keyset_ids,
+                    sorted(all_keyset_ids),
                 )
 
         # --- Tier 3: Brute-force ---
@@ -1971,6 +1975,13 @@ class MatterDeviceController:
             endpoint,
             Clusters.Groups.Commands.RemoveAllGroups(),
         )
+        # Brief barrier so the device can commit the RemoveAllGroups state update
+        # before we read GroupKeyMap back for cleanup.  Some devices (including
+        # consumer devices like Tapo) have async internal state machines that may
+        # not reflect the cleared group table immediately; without this pause
+        # GroupKeyMap can still contain stale entries and referenced_ids will be
+        # non-empty, causing cleanup to incorrectly preserve orphaned keysets.
+        await asyncio.sleep(0.3)
         await self._cleanup_unused_keysets_on_node(node_id)
         # Remove node from provisioned-nodes tracker for every group it was in.
         changed_groups = [

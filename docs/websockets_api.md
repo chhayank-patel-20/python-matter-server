@@ -959,11 +959,13 @@ Sends `Groups.RemoveGroup` to the device, then automatically removes any keysets
 
 **`group_remove_all`** — Remove all groups from a node endpoint
 
-Sends `Groups.RemoveAllGroups` to the device, then automatically removes all orphaned keysets using a 3-tier strategy:
+Sends `Groups.RemoveAllGroups` to the device, waits 300 ms for the device to commit its internal state, then removes all orphaned keysets using a 3-tier strategy:
 
-1. **Tier 1 — `GroupKeyTable`** (preferred): reads the device's full keyset table. Spec-compliant devices expose this; subtract any still-referenced keysets and remove orphans.
-2. **Tier 2 — controller tracker** (`node_keysets`): if the device does not expose `GroupKeyTable` (e.g. Tapo), use the server's persistent record of every `KeySetWrite` it sent to this node.
-3. **Tier 3 — brute-force** (mandatory fallback): if both tiers above produce no keyset IDs, iterate IDs 1–31 and call `KeySetRemove` on each. Devices return `NOT_FOUND` for IDs that do not exist — those errors are silently ignored. This tier is never skipped, ensuring keyset slots are always reclaimed even on fully constrained devices.
+1. **Tier 1 — `GroupKeyTable`** (preferred): reads the device's full keyset table. Spec-compliant devices expose this; subtract still-referenced keysets and remove orphans. Logged as `"using Tier-1 (GroupKeyTable)"`.
+2. **Tier 2 — controller tracker** (`node_keysets`): if the device does not expose `GroupKeyTable` (e.g. Tapo), use the server's persistent record of every `KeySetWrite` it sent to this node. Logged as `"using Tier-2 (controller tracker)"`.
+3. **Tier 3 — brute-force** (mandatory fallback): if both tiers above produce no keyset IDs, iterate IDs 1–63 and call `KeySetRemove` on each. Devices return `NOT_FOUND` for IDs that do not exist — those errors are silently ignored. Logged as a `WARNING`. This tier is **never skipped**, ensuring keyset slots are always reclaimed even on fully constrained devices.
+
+> The 300 ms sync barrier prevents a race where some devices have not yet flushed the `RemoveAllGroups` state to their internal key map before the server reads `GroupKeyMap` to discover referenced keysets. Without it, stale `GroupKeyMap` entries can cause cleanup to incorrectly preserve orphaned keysets.
 
 > After this call the node's keyset slots are fully reclaimed regardless of how much the device exposes about its internal state.
 

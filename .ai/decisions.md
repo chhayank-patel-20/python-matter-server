@@ -267,3 +267,17 @@ The previous TLV injection stored the raw epoch key as `TagKeyValue` (tag 6) and
 ### 3. Brute-force errors are suppressed; non-brute-force errors are warnings
 - **Decision**: In the shared removal loop, `brute_force` flag distinguishes expected `NOT_FOUND` noise from unexpected failures. Non-brute-force failures still emit `LOGGER.warning` with full traceback.
 - **Rationale**: Prevents log spam of 31 `NOT_FOUND` exceptions on every `group_remove_all` call while preserving visibility into genuine removal failures.
+
+## 2026-03-26: Cleanup Polish (Sync Barrier, Wider Range, INFO Logs)
+
+### 1. 300 ms sync barrier after RemoveAllGroups
+- **Decision**: Added `await asyncio.sleep(0.3)` in `group_remove_all` between `RemoveAllGroups()` and `_cleanup_unused_keysets_on_node()`.
+- **Rationale**: Some devices (including consumer devices like Tapo) have async internal state machines. `GroupKeyMap` can still contain stale group-to-keyset bindings immediately after `RemoveAllGroups`, causing cleanup to treat them as "referenced" and skip the associated keysets. The 300 ms barrier gives the device time to commit the cleared state before we read it back for the orphaned-keyset diff.
+
+### 2. Brute-force range widened from 1-31 to 1-63
+- **Decision**: `_BRUTE_FORCE_KEYSET_RANGE = range(1, 64)`.
+- **Rationale**: Keyset IDs can be sparse (not necessarily 1..N). A range of 1-31 may miss higher IDs assigned by other controllers or by devices that choose non-sequential IDs. Doubling to 1-63 covers all practical deployments at negligible cost — devices return `NOT_FOUND` instantly for IDs that don't exist.
+
+### 3. Tier 1 / Tier 2 logs elevated from DEBUG to INFO
+- **Decision**: Both `"using Tier-1 (GroupKeyTable)"` and `"using Tier-2 (controller tracker)"` log at INFO level with the discovered keyset IDs.
+- **Rationale**: Cleanup tier selection is operationally significant. Debug logs are invisible in default deployments, so issues with cleanup strategy (e.g. always falling through to brute-force) go unnoticed. INFO-level logs surface this in production without requiring debug mode.
