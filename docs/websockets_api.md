@@ -882,11 +882,11 @@ The server:
 2. Generates a random 128-bit epoch key for the group (first time only) and injects it into the controller's `GroupDataProvider`
 3. Calls `Groups.GetGroupMembership` to check the current group table and remaining capacity
 4. If the table is **full** (`remaining_capacity == 0`) and the group is not already a member, the **oldest group is removed (FIFO)** to free a slot before proceeding
-5. Reads the device's `GroupKeyManagement.GroupKeyMap` and the controller's keyset tracker
-6. Calls `GroupKeyManagement.KeySetWrite` to install the key on the device, **unless** the tracker confirms `KeySetWrite` was already sent **and** the binding exists in `GroupKeyMap`. A binding alone is not sufficient proof — the keyset can be lost while the binding remains (device reset, firmware update, silent write failure).
-7. If the device keyset table is full (`ResourceExhausted`), cleans up orphaned keysets first (via `KeySetRemove`) and retries. If still full, reuses a server-managed keyset that is confirmed on the device by both `GroupKeyMap` and the tracker.
-8. Updates the device's `GroupKeyMap` to bind the group ID to the keyset
-9. Sends `Groups.AddGroup` to the device endpoint
+5. Always calls `GroupKeyManagement.KeySetWrite` (endpoint 0) to install the key on the device — idempotent per spec, never skipped
+6. If `ResourceExhausted`, cleans up orphaned keysets (3-tier: `GroupKeyTable` → tracker → brute-force 1–63) and retries. If still full, reuses a server-managed keyset already on the device.
+7. Updates the device's `GroupKeyMap` (endpoint 0) to bind the group ID to the keyset
+8. Sends `Groups.AddGroup` to the device endpoint
+9. **Adds a Group-auth ACL entry** (`privilege=Operate`, `authMode=kGroup`, `subjects=[group_id]`) to the device's Access Control List — required by Matter spec §5.7.2. Without this entry the device silently drops all groupcast frames addressed to this group.
 10. Records the node in the `group_nodes` tracker so `group_send_command` can verify device-side keyset presence before future multicasts
 
 Call this once per endpoint/node you want to add to the group. Group membership is stored
@@ -937,7 +937,7 @@ group_add(node_id=3, endpoint=1, group_id=100, group_name="Lights")
 
 **`group_remove`** — Remove a node endpoint from a group
 
-Sends `Groups.RemoveGroup` to the device, then automatically removes any keysets that are no longer referenced by any group on that node.
+Sends `Groups.RemoveGroup` to the device, removes orphaned keysets (3-tier cleanup), then removes the Group-auth ACL entry for this group from the device's ACL.
 
 > **Matter spec note:** `RemoveGroup` clears the group membership entry but does **not** remove the associated keyset. The server runs `_cleanup_unused_keysets_on_node` after every removal — see `group_remove_all` for the 3-tier cleanup strategy.
 

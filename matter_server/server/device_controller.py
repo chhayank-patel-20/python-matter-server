@@ -1468,9 +1468,13 @@ class MatterDeviceController:
         1. Validates Groups cluster support via Descriptor.ServerList.
         2. Generates and stores group encryption keys (first time only).
         3. Injects keys into the controller's GroupDataProvider (KVS).
-        4. Provisions the node via GroupKeyManagement (keyset reuse-first, see
-           _provision_group_keys_on_node for the full algorithm).
-        5. Sends Groups.AddGroup to the device endpoint.
+        4. Checks and enforces group-table capacity (FIFO eviction if full).
+        5. Provisions the node via GroupKeyManagement: KeySetWrite + GroupKeyMap.
+        6. Sends Groups.AddGroup to the device endpoint.
+        7. Adds a Group-auth ACL entry (privilege=Operate, authMode=kGroup,
+           subjects=[group_id]) so the device accepts groupcast frames (Matter
+           spec §5.7.2 — without this the device silently drops multicast).
+        8. Records the node in the provisioned-nodes tracker.
 
         Group membership is authoritative on the device, not on the server.
         """
@@ -1548,13 +1552,174 @@ class MatterDeviceController:
             timed_request_timeout_ms=5000,
         )
 
-        # 7. Record that this node is provisioned for the group so that
+        # 7. Add Group-auth ACL entry so the device accepts groupcast frames.
+        #    Matter spec §5.7.2: without authMode=kGroup in the ACL for this
+        #    group_id the device silently rejects all multicast commands.
+        await self._ensure_group_acl_on_node(node_id, group_id)
+
+        # 8. Record that this node is provisioned for the group so that
         #    send_group_command can verify device-side keyset presence before multicast.
         provisioned = self._group_provisioned_nodes.setdefault(group_id, set())
         provisioned.add(node_id)
         self.server.storage.set(
             DATA_KEY_GROUP_NODES, sorted(provisioned), subkey=str(group_id)
         )
+
+    async def _ensure_group_acl_on_node(self, node_id: int, group_id: int) -> None:
+        """Ensure the device ACL has a Group-auth entry for group_id.
+
+        Matter spec §5.7.2 requires a matching ACL entry with authMode=kGroup for
+        the device to accept group commands addressed to this group.  Without this
+        entry the device silently drops all groupcast frames — no error is returned
+        because multicast is fire-and-forget.
+
+        This call is additive: existing ACL entries are preserved.  The write is
+        skipped if a matching entry already exists (idempotent).  Any failure is
+        logged as a warning so that a non-critical ACL failure does not block
+        the group_add flow.
+        """
+        try:
+            # Read current fabric-filtered ACL.
+            result = await self._chip_device_controller.read_attribute(
+                node_id=node_id,
+                attributes=[(0, Clusters.AccessControl.Attributes.Acl)],
+            )
+            current_acl: list = []
+            if result is not None and result.attributes is not None:
+                current_acl = list(
+                    result.attributes[0][Clusters.AccessControl][
+                        Clusters.AccessControl.Attributes.Acl
+                    ]
+                )
+
+            group_auth_mode = (
+                Clusters.AccessControl.Enums.AccessControlEntryAuthModeEnum.kGroup
+            )
+            # Skip write if a matching Group-auth entry for this group_id exists.
+            for entry in current_acl:
+                if getattr(entry, "authMode", None) == group_auth_mode and group_id in (
+                    getattr(entry, "subjects", None) or []
+                ):
+                    LOGGER.debug(
+                        "Group ACL entry for group %s already present on node %s",
+                        group_id,
+                        node_id,
+                    )
+                    return
+
+            # Append the new Group-auth entry and write the updated ACL.
+            current_acl.append(
+                Clusters.AccessControl.Structs.AccessControlEntryStruct(
+                    privilege=Clusters.AccessControl.Enums.AccessControlEntryPrivilegeEnum.kOperate,
+                    authMode=group_auth_mode,
+                    subjects=[group_id],
+                    targets=None,
+                    fabricIndex=0,  # SDK fills this in
+                )
+            )
+            await self._chip_device_controller.write_attribute(
+                node_id=node_id,
+                attributes=[(0, Clusters.AccessControl.Attributes.Acl(current_acl))],
+            )
+            LOGGER.info(
+                "Added Group ACL entry for group %s on node %s", group_id, node_id
+            )
+        except Exception as err:  # noqa: BLE001  # pylint: disable=W0718
+            LOGGER.warning(
+                "Failed to set Group ACL entry for group %s on node %s: %s. "
+                "Groupcast to this node may be silently rejected.",
+                group_id,
+                node_id,
+                err,
+            )
+
+    async def _remove_group_acl_on_node(self, node_id: int, group_id: int) -> None:
+        """Remove the Group-auth ACL entry for group_id from the device.
+
+        Called by group_remove / group_remove_all to keep the ACL table tidy.
+        A stale ACL entry does not break anything (the group no longer exists on
+        the device), but clean removal is good hygiene.  Any failure is a warning.
+        """
+        try:
+            result = await self._chip_device_controller.read_attribute(
+                node_id=node_id,
+                attributes=[(0, Clusters.AccessControl.Attributes.Acl)],
+            )
+            if result is None or result.attributes is None:
+                return
+            current_acl: list = list(
+                result.attributes[0][Clusters.AccessControl][
+                    Clusters.AccessControl.Attributes.Acl
+                ]
+            )
+            group_auth_mode = (
+                Clusters.AccessControl.Enums.AccessControlEntryAuthModeEnum.kGroup
+            )
+            new_acl = [
+                e
+                for e in current_acl
+                if not (
+                    getattr(e, "authMode", None) == group_auth_mode
+                    and group_id in (getattr(e, "subjects", None) or [])
+                )
+            ]
+            if len(new_acl) == len(current_acl):
+                return  # nothing to remove
+            await self._chip_device_controller.write_attribute(
+                node_id=node_id,
+                attributes=[(0, Clusters.AccessControl.Attributes.Acl(new_acl))],
+            )
+            LOGGER.info(
+                "Removed Group ACL entry for group %s on node %s", group_id, node_id
+            )
+        except Exception as err:  # noqa: BLE001  # pylint: disable=W0718
+            LOGGER.warning(
+                "Failed to remove Group ACL entry for group %s on node %s: %s",
+                group_id,
+                node_id,
+                err,
+            )
+
+    async def _remove_all_group_acl_entries_on_node(self, node_id: int) -> None:
+        """Remove all Group-auth ACL entries from the device.
+
+        Called by group_remove_all after all group memberships have been cleared.
+        """
+        try:
+            result = await self._chip_device_controller.read_attribute(
+                node_id=node_id,
+                attributes=[(0, Clusters.AccessControl.Attributes.Acl)],
+            )
+            if result is None or result.attributes is None:
+                return
+            current_acl: list = list(
+                result.attributes[0][Clusters.AccessControl][
+                    Clusters.AccessControl.Attributes.Acl
+                ]
+            )
+            group_auth_mode = (
+                Clusters.AccessControl.Enums.AccessControlEntryAuthModeEnum.kGroup
+            )
+            new_acl = [
+                e
+                for e in current_acl
+                if getattr(e, "authMode", None) != group_auth_mode
+            ]
+            if len(new_acl) == len(current_acl):
+                return  # nothing to remove
+            await self._chip_device_controller.write_attribute(
+                node_id=node_id,
+                attributes=[(0, Clusters.AccessControl.Attributes.Acl(new_acl))],
+            )
+            LOGGER.info(
+                "Removed all Group ACL entries from node %s (%d removed)",
+                node_id,
+                len(current_acl) - len(new_acl),
+            )
+        except Exception as err:  # noqa: BLE001  # pylint: disable=W0718
+            LOGGER.warning(
+                "Failed to remove Group ACL entries from node %s: %s", node_id, err
+            )
 
     async def _get_group_membership_and_capacity(
         self, node_id: int, endpoint: int
@@ -1909,6 +2074,7 @@ class MatterDeviceController:
             Clusters.Groups.Commands.RemoveGroup(groupID=group_id),
         )
         await self._cleanup_unused_keysets_on_node(node_id)
+        await self._remove_group_acl_on_node(node_id, group_id)
         # Remove node from the provisioned-nodes tracker for this group.
         provisioned = self._group_provisioned_nodes.get(group_id)
         if provisioned and node_id in provisioned:
@@ -1939,6 +2105,7 @@ class MatterDeviceController:
         # non-empty, causing cleanup to incorrectly preserve orphaned keysets.
         await asyncio.sleep(0.3)
         await self._cleanup_unused_keysets_on_node(node_id)
+        await self._remove_all_group_acl_entries_on_node(node_id)
         # Remove node from provisioned-nodes tracker for every group it was in.
         changed_groups = [
             gid

@@ -299,3 +299,18 @@ The previous TLV injection stored the raw epoch key as `TagKeyValue` (tag 6) and
 ### 4. `tracked_keysets` variable removed
 - **Decision**: Deleted `tracked_keysets = set(self._known_keysets_per_node.get(node_id, set()))` from `_provision_group_keys_on_node`.
 - **Rationale**: The variable was only referenced in the two removed skip conditions. Removing it prevents ruff from flagging an unused variable.
+
+## 2026-03-26: Group ACL Fix for Silent Groupcast Drops
+
+### 1. Add Group-auth ACL entry as mandatory step in `group_add`
+- **Decision**: `group_add` now calls `_ensure_group_acl_on_node(node_id, group_id)` as step 7, writing an `AccessControlEntryStruct` with `privilege=kOperate, authMode=kGroup, subjects=[group_id]` to the device's `AccessControl.Acl` attribute at endpoint 0.
+- **Rationale**: Matter spec §5.7.2 requires a matching ACL entry with `authMode=kGroup` for group commands to be accepted by the device. Without this entry the device silently drops all groupcast frames — no error is returned since multicast is fire-and-forget. This was the root cause of "silent groupcast drops" despite all other steps (KeySetWrite, GroupKeyMap, AddGroup, controller keyset, multicast node_id) completing successfully.
+- **Non-fatal**: `_ensure_group_acl_on_node` wraps the write in try/except and logs a warning on failure rather than raising, so ACL write failures do not break `group_add` flow.
+
+### 2. ACL cleanup on group removal
+- **Decision**: `group_remove` calls `_remove_group_acl_on_node(node_id, group_id)` after keyset cleanup. `group_remove_all` calls `_remove_all_group_acl_entries_on_node(node_id)` which filters out all `kGroup` ACL entries.
+- **Rationale**: ACL entries are device resources; leaking them would consume ACL table slots on constrained devices. Since Matter spec does not auto-cleanup ACL entries on group removal (similar to keysets), explicit cleanup is required.
+
+### 3. ACL read-modify-write pattern
+- **Decision**: All three ACL helpers (`_ensure_group_acl_on_node`, `_remove_group_acl_on_node`, `_remove_all_group_acl_entries_on_node`) read the current ACL first, modify in Python, and write back the full list.
+- **Rationale**: `AccessControl.Attributes.Acl` is a list attribute — the device stores the complete list, not individual entries. The write replaces the entire list. Reading first preserves all existing unicast and admin ACL entries. This is the same pattern used by `set_acl_entry` in the existing codebase.
