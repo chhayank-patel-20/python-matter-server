@@ -24,6 +24,7 @@
 
 - [x] Refactor group management to be Matter spec-compliant: removed server-side group registry (`add_group`/`remove_group`/`get_groups`/`MatterGroupInfo`), removed auto `init_group_testing_data` at startup, added `Descriptor.ServerList` validation in `group_add`, simplified controller key injection (`_inject_controller_group_keys` replaces `_ensure_controller_group_keys` + `_overwrite_controller_keyset`).
 - [x] Rewrite `docs/websockets_api.md` with full descriptions, parameter tables, and example responses for every command and event.
+- [x] Fix `InteractionModelError: ResourceExhausted (0x89)` during `group_add` key provisioning: read device `GroupKeyMap` before writing, skip `KeySetWrite` if keyset already installed, fall back to reusing a server-managed keyset already on the device if the table is full. New helpers: `_get_node_group_key_map`, `_provision_group_keys_on_node`, `_is_resource_exhausted_err`.
 
 ## Backlog
 - [ ] Add `discover` command to `scripts/cli_client.py`.

@@ -157,3 +157,17 @@ The previous TLV injection stored the raw epoch key as `TagKeyValue` (tag 6) and
 ### 2. Fix `InvalidCommand` (0x85) for Non-Test Groups
 - **Decision**: Updated `group_add_key_set` to use `epochStartTime0=1` instead of `0`.
 - **Rationale**: Per Matter Core Spec §11.2.6.1.1, if `EpochKey0` is not null, `EpochStartTime0` must be a non-zero value. Real devices (like Tapo) strictly enforce this and reject `KeySetWrite` with `InvalidCommand` if it is zero. Setting it to `1` (1 microsecond past the Matter epoch) satisfies the spec and allows successful key provisioning.
+
+## 2026-03-26: ResourceExhausted Fix for group_add Key Provisioning
+
+### 1. Device as source of truth for keyset state
+- **Decision**: Before calling `KeySetWrite`, read the device's `GroupKeyManagement.Attributes.GroupKeyMap` to determine which keysets are already installed. Skip `KeySetWrite` if the exact keyset is already present; only write if the device doesn't have it yet.
+- **Rationale**: Devices have a fixed keyset table (typically 3 slots). Blindly writing a new keyset on every `group_add` call exhausted the table, causing `ResourceExhausted (0x89)` on the second group. The device is authoritative; the server-side `_group_key_store` is only for crypto material persistence.
+
+### 2. Fallback to reusable server-managed keyset on ResourceExhausted
+- **Decision**: If `KeySetWrite` returns `ResourceExhausted`, compute the intersection of server-managed keyset IDs and the keyset IDs already on the device. Reuse the lowest-ID match by remapping `group_id → that keyset` in `_group_key_store` and updating the device's `GroupKeyMap`.
+- **Rationale**: If the table is truly full, we cannot install a new keyset. But we can reuse a keyset the server already knows the key for — any server-managed keyset already on the device shares the same epoch key, so `SendGroupCommand` will still encrypt correctly.
+
+### 3. New helpers: `_get_node_group_key_map`, `_provision_group_keys_on_node`, `_is_resource_exhausted_err`
+- **Decision**: Extracted provisioning logic into a dedicated `_provision_group_keys_on_node` coroutine called by `group_add`. Reading the device state is always done via `_get_node_group_key_map`. Error classification is handled by the static `_is_resource_exhausted_err`.
+- **Rationale**: Keeps `group_add` clean and readable; makes the provisioning algorithm independently testable.

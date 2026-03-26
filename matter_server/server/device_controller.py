@@ -1435,7 +1435,8 @@ class MatterDeviceController:
         1. Validates Groups cluster support via Descriptor.ServerList.
         2. Generates and stores group encryption keys (first time only).
         3. Injects keys into the controller's GroupDataProvider (KVS).
-        4. Provisions the node via GroupKeyManagement.KeySetWrite + GroupKeyMap.
+        4. Provisions the node via GroupKeyManagement (keyset reuse-first, see
+           _provision_group_keys_on_node for the full algorithm).
         5. Sends Groups.AddGroup to the device endpoint.
 
         Group membership is authoritative on the device, not on the server.
@@ -1464,10 +1465,12 @@ class MatterDeviceController:
 
         keyset_id, epoch_key_hex = self._group_key_store[group_id]
 
-        # 4. Provision the node with the group's encryption keys.
+        # 4. Provision the node (reads device state first, reuses keysets where
+        #    possible, handles ResourceExhausted gracefully).
         try:
-            await self.group_add_key_set(node_id, keyset_id, epoch_key_hex)
-            await self.group_bind_key_set(node_id, group_id, keyset_id)
+            await self._provision_group_keys_on_node(
+                node_id, group_id, keyset_id, epoch_key_hex
+            )
         except (ChipStackError, InteractionModelError) as err:
             LOGGER.warning(
                 "Failed to provision node %s with group keys — groupcast to this node "
@@ -1483,6 +1486,158 @@ class MatterDeviceController:
             Clusters.Groups.Commands.AddGroup(groupID=group_id, groupName=group_name),
             timed_request_timeout_ms=5000,
         )
+
+    async def _get_node_group_key_map(
+        self, node_id: int
+    ) -> list[Clusters.GroupKeyManagement.Structs.GroupKeyMapStruct]:
+        """Read GroupKeyMap from the device (endpoint 0, fabric-scoped).
+
+        Returns the raw list of GroupKeyMapStruct entries, or an empty list on failure.
+        """
+        try:
+            read_result = await self._chip_device_controller.read_attribute(
+                node_id=node_id,
+                attributes=[(0, Clusters.GroupKeyManagement.Attributes.GroupKeyMap)],
+            )
+        except Exception:  # noqa: BLE001  # pylint: disable=W0718
+            return []
+        if read_result is None or read_result.attributes is None:
+            return []
+        try:
+            result: list[Clusters.GroupKeyManagement.Structs.GroupKeyMapStruct] = (
+                read_result.attributes[0][Clusters.GroupKeyManagement][
+                    Clusters.GroupKeyManagement.Attributes.GroupKeyMap
+                ]
+            )
+            return result
+        except (KeyError, TypeError):
+            return []
+
+    async def _provision_group_keys_on_node(
+        self,
+        node_id: int,
+        group_id: int,
+        keyset_id: int,
+        epoch_key_hex: str,
+    ) -> None:
+        """Provision group encryption keys on a node, reusing existing keysets where possible.
+
+        Algorithm (follows Matter Group Key Management Cluster semantics):
+
+        1. Read the device's current GroupKeyMap (fabric-scoped).
+        2. If group_id is already bound to our keyset_id → fully provisioned, return early.
+        3. If keyset_id already appears in any mapping on the device → the keyset is
+           already installed; skip KeySetWrite and only update the GroupKeyMap entry.
+        4. Otherwise write the keyset via KeySetWrite, then update GroupKeyMap.
+        5. On ResourceExhausted (0x89): the device keyset table is full.  Find a
+           keyset that is (a) already on the device and (b) known to the server
+           (i.e. in _group_key_store).  Update both the device GroupKeyMap and our
+           local key store to use that reused keyset.  Raises InvalidArguments if
+           no reusable keyset can be found.
+        """
+        # 1. Read current device GroupKeyMap.
+        entries = await self._get_node_group_key_map(node_id)
+        existing_bindings: dict[int, int] = {
+            e.groupId: e.groupKeySetID for e in entries
+        }
+        device_keyset_ids: set[int] = set(existing_bindings.values())
+
+        # 2. Already fully provisioned for this group with our keyset.
+        if existing_bindings.get(group_id) == keyset_id:
+            LOGGER.debug(
+                "Group %s already provisioned on node %s with keyset_id %s",
+                group_id,
+                node_id,
+                keyset_id,
+            )
+            return
+
+        # 3 & 4. Write keyset only if it is not already installed on the device.
+        actual_keyset_id = keyset_id
+        actual_epoch_key_hex = epoch_key_hex
+
+        if keyset_id not in device_keyset_ids:
+            try:
+                await self.group_add_key_set(node_id, keyset_id, epoch_key_hex)
+            except InteractionModelError as err:
+                if not self._is_resource_exhausted_err(err):
+                    raise
+
+                # 5. ResourceExhausted — device keyset table is full.
+                # Build {keyset_id: epoch_key_hex} for every keyset we know about.
+                our_keyset_map: dict[int, str] = dict(self._group_key_store.values())
+                reusable = set(our_keyset_map.keys()) & device_keyset_ids
+                if not reusable:
+                    raise InvalidArguments(
+                        f"Cannot provision group {group_id} on node {node_id}: "
+                        "device keyset table is full and no server-managed keyset "
+                        "is installed on this device. Remove unused group memberships "
+                        "or keysets on the device before adding more groups."
+                    ) from err
+
+                # Pick the lowest reusable keyset_id (stable, deterministic).
+                actual_keyset_id = min(reusable)
+                actual_epoch_key_hex = our_keyset_map[actual_keyset_id]
+                LOGGER.warning(
+                    "Node %s keyset table full — reusing keyset_id %s for group %s",
+                    node_id,
+                    actual_keyset_id,
+                    group_id,
+                )
+
+                # Persist the remapped keyset so future provisioning uses the same one.
+                if self._group_key_store.get(group_id) != (
+                    actual_keyset_id,
+                    actual_epoch_key_hex,
+                ):
+                    self._group_key_store[group_id] = (
+                        actual_keyset_id,
+                        actual_epoch_key_hex,
+                    )
+                    self.server.storage.set(
+                        DATA_KEY_GROUP_KEYS,
+                        {
+                            "keyset_id": actual_keyset_id,
+                            "epoch_key_hex": actual_epoch_key_hex,
+                        },
+                        subkey=str(group_id),
+                    )
+                    self._inject_controller_group_keys(
+                        group_id, actual_keyset_id, actual_epoch_key_hex
+                    )
+
+        # Update GroupKeyMap: bind group_id → actual_keyset_id.
+        # Re-read first to get the freshest view (keyset write may have triggered changes).
+        latest_entries = await self._get_node_group_key_map(node_id)
+        new_map = [m for m in latest_entries if m.groupId != group_id]
+        new_map.append(
+            Clusters.GroupKeyManagement.Structs.GroupKeyMapStruct(
+                groupId=group_id,
+                groupKeySetID=actual_keyset_id,
+                fabricIndex=0,  # SDK fills this in
+            )
+        )
+        await self._chip_device_controller.write_attribute(
+            node_id=node_id,
+            attributes=[
+                (0, Clusters.GroupKeyManagement.Attributes.GroupKeyMap(new_map))
+            ],
+            timed_request_timeout_ms=5000,
+        )
+        LOGGER.info(
+            "Provisioned node %s: group %s → keyset_id %s",
+            node_id,
+            group_id,
+            actual_keyset_id,
+        )
+
+    @staticmethod
+    def _is_resource_exhausted_err(err: InteractionModelError) -> bool:
+        """Return True if the error is a Matter ResourceExhausted (status 0x89)."""
+        try:
+            return int(err.status) == 0x89
+        except (AttributeError, TypeError, ValueError):
+            return "ResourceExhausted" in str(err)
 
     @api_command(APICommand.GROUP_REMOVE)
     async def group_remove(self, node_id: int, endpoint: int, group_id: int) -> None:
