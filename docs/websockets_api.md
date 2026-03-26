@@ -869,6 +869,7 @@ is queried directly from the device with `group_list` or `group_get_membership`.
 **Server-side state (what the server does persist):**
 - `group_keys` — one entry per group ID: the epoch key and keyset ID used to encrypt groupcast frames. Required so the controller can send multicast after a restart without re-running `group_add` on every node.
 - `node_keysets` — per-node set of keyset IDs the server has explicitly written via `KeySetWrite`. Used as a fallback source for keyset cleanup on devices that do not expose `GroupKeyManagement.Attributes.GroupKeyTable` (e.g. Tapo).
+- `group_nodes` — per-group set of node IDs that have been provisioned via `group_add`. Used by `group_send_command` to verify device-side keyset presence before sending multicast (automatic re-provisioning if needed).
 
 Everything else (group membership, group names, keyset bindings) lives on the device.
 
@@ -886,6 +887,7 @@ The server:
 7. If the device keyset table is full (`ResourceExhausted`), cleans up orphaned keysets first (via `KeySetRemove`) and retries. If still full, reuses a server-managed keyset that is confirmed on the device by both `GroupKeyMap` and the tracker.
 8. Updates the device's `GroupKeyMap` to bind the group ID to the keyset
 9. Sends `Groups.AddGroup` to the device endpoint
+10. Records the node in the `group_nodes` tracker so `group_send_command` can verify device-side keyset presence before future multicasts
 
 Call this once per endpoint/node you want to add to the group. Group membership is stored
 on the device — not on the server.
@@ -1068,6 +1070,11 @@ keys will process the command simultaneously.
 The group must have at least one endpoint added via `group_add` so that the controller has
 the encryption keys for that group ID.
 
+**Send flow (automatic, no client action needed):**
+1. Check that the controller has encryption keys for this group ID (from `group_keys` store).
+2. For every node recorded in `group_nodes` for this group: if the controller tracker (`node_keysets`) does not confirm that `KeySetWrite` was sent to that node, re-provision it by calling `_provision_group_keys_on_node` (which sends `KeySetWrite` to the device). This ensures silent drops due to device-side missing keysets are fixed automatically before multicast.
+3. Send the encrypted multicast frame to the group.
+
 ```json
 {
   "message_id": "1",
@@ -1094,8 +1101,8 @@ the encryption keys for that group ID.
 > There is no confirmation that individual nodes received or executed the command.
 
 **Common Errors:**
-- `CHIP Error 0xAC (Internal Error)` — The **controller** lacks encryption keys for this group ID in its local SDK storage (e.g. after a server restart). The server automatically re-injects the keys and retries once. **Important:** if the groupcast still has no effect after the retry (no error but device ignores it), the **device** is missing the keyset — call `group_add` again on each affected node to re-run `KeySetWrite` on the device. `SetSdkKey ≠ KeySetWrite`: re-injection only restores the controller-side key, not the device-side key.
-- `CHIP Error 0x32 (Timeout)` — A CASE session could not be established with a node (mDNS lookup failed or device is offline). This does not affect groupcast delivery to other online nodes.
+- `CHIP Error 0xAC (Internal Error)` — The **controller** lacks encryption keys for this group ID in its local SDK storage (e.g. after a server restart before re-provisioning ran). The server automatically re-injects the keys and retries once. The pre-send re-provisioning step (see Send flow above) normally prevents this for nodes tracked in `group_nodes`. If groupcast still has no effect after the retry, call `group_add` again on each affected node to force `KeySetWrite`.
+- `CHIP Error 0x32 (Timeout)` — A CASE session could not be established with a node during pre-send re-provisioning (mDNS lookup failed or device is offline). The server logs a warning and proceeds with the multicast; that specific node may not respond. Other online nodes are unaffected.
 
 ---
 
@@ -1126,7 +1133,11 @@ Returns the device's live `GroupKeyMap`, the controller-tracked keysets for the 
     "group_key_store_entries": [
       { "group_id": 100, "keyset_id": 101 },
       { "group_id": 200, "keyset_id": 101 }
-    ]
+    ],
+    "provisioned_nodes_for_group": {
+      "100": [1, 2, 3],
+      "200": [1]
+    }
   }
 }
 ```
@@ -1137,6 +1148,7 @@ Returns the device's live `GroupKeyMap`, the controller-tracked keysets for the 
 | `controller_tracked_keysets` | Keyset IDs the server has written to this node via `KeySetWrite` |
 | `inferred_orphaned_keysets` | `controller_tracked - referenced_by_map - {0}` — these will be removed on next cleanup |
 | `group_key_store_entries` | The server's crypto store — group→keyset mappings used for groupcast encryption |
+| `provisioned_nodes_for_group` | Node IDs provisioned per group (from `group_nodes` tracker) — used by `group_send_command` for pre-send re-provisioning |
 
 ---
 

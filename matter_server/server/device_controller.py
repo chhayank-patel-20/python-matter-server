@@ -93,6 +93,9 @@ if TYPE_CHECKING:
 DATA_KEY_NODES = "nodes"
 DATA_KEY_GROUP_KEYS = "group_keys"
 DATA_KEY_NODE_KEYSETS = "node_keysets"  # node_id → [keyset_id, ...] controller-tracked
+DATA_KEY_GROUP_NODES = (
+    "group_nodes"  # group_id → [node_id, ...] provisioned nodes per group
+)
 DATA_KEY_LAST_NODE_ID = "last_node_id"
 _MATTER_BLE_SERVICE_UUID = "0000fff6-0000-1000-8000-00805f9b34fb"
 
@@ -194,6 +197,9 @@ class MatterDeviceController:
         # Controller-side keyset tracker: node_id → set of keyset_ids we have written.
         # Used as fallback source for cleanup when GroupKeyTable is unavailable on the device.
         self._known_keysets_per_node: dict[int, set[int]] = {}
+        # Provisioned-nodes tracker: group_id → set of node_ids provisioned for that group.
+        # Used by send_group_command to verify device-side keyset presence before multicast.
+        self._group_provisioned_nodes: dict[int, set[int]] = {}
         self._custom_attribute_poller_timer: asyncio.TimerHandle | None = None
         self._custom_attribute_poller_task: asyncio.Task | None = None
         self._attribute_update_callbacks: dict[int, list[Callable]] = {}
@@ -206,7 +212,7 @@ class MatterDeviceController:
         )
         await load_local_updates(self._ota_provider_dir)
 
-    async def start(self) -> None:
+    async def start(self) -> None:  # pylint: disable=too-many-locals
         """Handle logic on controller start."""
         # Load group crypto material from persistent storage.
         # Keys are already injected into the SDK's KVS (chip.json) from when each
@@ -229,6 +235,17 @@ class MatterDeviceController:
             self._known_keysets_per_node[int(nid_str)] = set(keyset_list)
         LOGGER.info(
             "Loaded keyset tracking for %d nodes", len(self._known_keysets_per_node)
+        )
+
+        # Load provisioned-nodes tracker: group_id → set of node_ids.
+        stored_group_nodes: dict[str, list[int]] = self.server.storage.get(
+            DATA_KEY_GROUP_NODES, {}
+        )
+        for gid_str, node_list in stored_group_nodes.items():
+            self._group_provisioned_nodes[int(gid_str)] = set(node_list)
+        LOGGER.info(
+            "Loaded provisioned-nodes tracking for %d groups",
+            len(self._group_provisioned_nodes),
         )
 
         # load nodes from persistent storage
@@ -1531,6 +1548,14 @@ class MatterDeviceController:
             timed_request_timeout_ms=5000,
         )
 
+        # 7. Record that this node is provisioned for the group so that
+        #    send_group_command can verify device-side keyset presence before multicast.
+        provisioned = self._group_provisioned_nodes.setdefault(group_id, set())
+        provisioned.add(node_id)
+        self.server.storage.set(
+            DATA_KEY_GROUP_NODES, sorted(provisioned), subkey=str(group_id)
+        )
+
     async def _get_group_membership_and_capacity(
         self, node_id: int, endpoint: int
     ) -> tuple[list[int], int | None]:
@@ -1884,6 +1909,13 @@ class MatterDeviceController:
             Clusters.Groups.Commands.RemoveGroup(groupID=group_id),
         )
         await self._cleanup_unused_keysets_on_node(node_id)
+        # Remove node from the provisioned-nodes tracker for this group.
+        provisioned = self._group_provisioned_nodes.get(group_id)
+        if provisioned and node_id in provisioned:
+            provisioned.discard(node_id)
+            self.server.storage.set(
+                DATA_KEY_GROUP_NODES, sorted(provisioned), subkey=str(group_id)
+            )
 
     @api_command(APICommand.GROUP_REMOVE_ALL)
     async def group_remove_all(self, node_id: int, endpoint: int) -> None:
@@ -1900,6 +1932,19 @@ class MatterDeviceController:
             Clusters.Groups.Commands.RemoveAllGroups(),
         )
         await self._cleanup_unused_keysets_on_node(node_id)
+        # Remove node from provisioned-nodes tracker for every group it was in.
+        changed_groups = [
+            gid
+            for gid, nodes in self._group_provisioned_nodes.items()
+            if node_id in nodes
+        ]
+        for gid in changed_groups:
+            self._group_provisioned_nodes[gid].discard(node_id)
+            self.server.storage.set(
+                DATA_KEY_GROUP_NODES,
+                sorted(self._group_provisioned_nodes[gid]),
+                subkey=str(gid),
+            )
 
     @api_command(APICommand.GROUP_LIST)
     async def group_list(self, node_id: int, endpoint: int) -> GroupListResult:
@@ -1967,6 +2012,11 @@ class MatterDeviceController:
                 {"group_id": gid, "keyset_id": kid}
                 for gid, (kid, _) in self._group_key_store.items()
             ],
+            "provisioned_nodes_for_group": {
+                str(gid): sorted(nodes)
+                for gid, nodes in self._group_provisioned_nodes.items()
+                if nodes
+            },
         }
 
     @staticmethod
@@ -2129,7 +2179,7 @@ class MatterDeviceController:
             return False
 
     @api_command(APICommand.GROUP_SEND_COMMAND)
-    async def send_group_command(
+    async def send_group_command(  # pylint: disable=too-many-locals
         self,
         group_id: int,
         cluster_id: int,
@@ -2146,6 +2196,39 @@ class MatterDeviceController:
         cluster_cls: Cluster = ALL_CLUSTERS[cluster_id]
         command_cls = getattr(cluster_cls.Commands, command_name)
         command = dataclass_from_dict(command_cls, payload, allow_sdk_types=True)
+
+        # Pre-send: verify every provisioned node has the keyset installed on the device.
+        # Without this, multicast frames are silently dropped by nodes that are missing
+        # the keyset (e.g. after a device reset or factory restore).
+        if group_id in self._group_key_store:
+            keyset_id_check, epoch_key_hex_check = self._group_key_store[group_id]
+            provisioned_nodes = set(self._group_provisioned_nodes.get(group_id, set()))
+            needs_reprovision = {
+                nid
+                for nid in provisioned_nodes
+                if keyset_id_check not in self._known_keysets_per_node.get(nid, set())
+            }
+            for nid in needs_reprovision:
+                LOGGER.info(
+                    "Node %s is provisioned for group %s but keyset_id %s is not in "
+                    "controller tracker — re-provisioning before groupcast",
+                    nid,
+                    group_id,
+                    keyset_id_check,
+                )
+                try:
+                    await self._provision_group_keys_on_node(
+                        nid, group_id, keyset_id_check, epoch_key_hex_check
+                    )
+                except (ChipStackError, InteractionModelError) as repro_err:
+                    LOGGER.warning(
+                        "Failed to re-provision node %s for group %s before groupcast: %s. "
+                        "That node may not respond to the group command.",
+                        nid,
+                        group_id,
+                        repro_err,
+                    )
+
         try:
             await self._chip_device_controller.send_group_command(group_id, command)
         except ChipStackError as err:

@@ -235,3 +235,17 @@ The previous TLV injection stored the raw epoch key as `TagKeyValue` (tag 6) and
 ### 4. SetSdkKey ≠ KeySetWrite (documented distinction)
 - **Decision**: The `send_group_command` 0xAC retry path now logs a clear warning explaining that re-injection is controller-local only, and instructs callers to run `group_add` if the device continues to ignore commands.
 - **Rationale**: `_inject_controller_group_keys` calls `SetSdkKey` — this writes to the CHIP controller's local GroupDataProvider (chip.json KVS), restoring the controller's ability to encrypt multicast frames. It does NOT send `KeySetWrite` to the device. If the device lost its keyset (factory reset, etc.), the multicast is sent but silently dropped. This distinction was a source of confusion and is now explicitly documented in both logs and API docs.
+
+## 2026-03-26: Pre-Send Device-Key Verification in send_group_command
+
+### 1. Add `_group_provisioned_nodes` tracker
+- **Decision**: Added `_group_provisioned_nodes: dict[int, set[int]]` (group_id → set of node_ids) persisted as `group_nodes` in server storage. `group_add` records the node after the successful `AddGroup` call. `group_remove` removes the node for that group. `group_remove_all` removes the node from all groups.
+- **Rationale**: Without tracking which nodes are in each group, `send_group_command` has no way to know which devices to verify before sending multicast. The tracker fills this gap without any live device queries at send time.
+
+### 2. Pre-send re-provisioning in `send_group_command`
+- **Decision**: Before sending the multicast, `send_group_command` checks every node in `_group_provisioned_nodes[group_id]`. If `keyset_id not in _known_keysets_per_node.get(node_id, set())`, it calls `_provision_group_keys_on_node` to force a `KeySetWrite` to that device before the multicast is sent. Failures are logged as warnings (not raised) so a single unreachable node does not block the multicast for all others.
+- **Rationale**: Implements the user-required send flow: (1) Check GroupKeyMap, (2) Ensure key exists on device (KeySetWrite if needed), (3) Send multicast. This eliminates silent groupcast drops caused by device-side missing keysets (device reset, firmware update, silent write failure on a previous call), without requiring any changes to the client API.
+
+### 3. `group_debug_info` extended with `provisioned_nodes_for_group`
+- **Decision**: Added `provisioned_nodes_for_group: dict[str, list[int]]` to the `group_debug_info` response, showing the contents of `_group_provisioned_nodes` for all non-empty groups.
+- **Rationale**: Gives developers visibility into which nodes the server will attempt to re-provision before groupcast, making it easier to diagnose why a node did or did not receive a re-provisioning attempt.
