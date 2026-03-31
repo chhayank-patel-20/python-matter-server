@@ -45,7 +45,10 @@
 - [x] Remove tracker-based KeySetWrite skip in `_provision_group_keys_on_node`: deleted the "fully provisioned" early return and the `device_keyset_ids & tracked_keysets` skip guard. KeySetWrite now always runs (idempotent per Matter spec §11.2.7.1.1). Aligns `group_add` with the already-correct `_ensure_keyset_on_node` pattern used in `send_group_command`. Reuse fallback now only requires GroupKeyMap confirmation (tracker check removed — tracker is controller assumption, not device truth).
 - [x] Fix silent groupcast drops: add Group-auth ACL entries to device (Matter spec §5.7.2). Root cause: device ACL had no `authMode=kGroup` entry for the group, so device silently rejected all groupcast frames. Added `_ensure_group_acl_on_node` (called from `group_add`), `_remove_group_acl_on_node` (called from `group_remove`), `_remove_all_group_acl_entries_on_node` (called from `group_remove_all`). All other groupcast prerequisites (KeySetWrite, GroupKeyMap, AddGroup, controller keyset, multicast node_id) were already correctly implemented.
 
+- [x] Fix `scripts/cli_client.py`: add missing `discover()` function + subparser, remove corrupted duplicate content at end of file.
+- [x] Update `docs/websockets_api.md`: expand `set_acl_entry` with ACL entry format table and real example; add "Group Management — 7-Step Flow" quick reference section mapping each step to WebSocket commands.
+- [x] Add "Frontend Implementation Guide" section to `docs/websockets_api.md`: complete request/response flows for connection lifecycle, commissioning, unicast commands, group setup/teardown, attribute read/write, error handling, and event handling.
+
 ## Backlog
-- [ ] Add `discover` command to `scripts/cli_client.py`.
 - [ ] Investigate why `discovery_updated` events are not appearing in the dashboard (optional).
 - [ ] Investigate mDNS/CASE session timeout for Node 27 (hardware/network issue — `CHIP Error 0x32: Timeout`). Node unreachable on mDNS; this is separate from group commands.

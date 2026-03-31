@@ -827,16 +827,42 @@ Common attribute paths:
 
 **`set_acl_entry`** — Set Access Control List entries on a node
 
+Replaces the **full ACL** on the node's endpoint 0. The list you provide becomes the new ACL — existing entries are not merged. This is the low-level equivalent of Matter's `accesscontrol write acl` operation.
+
+> **Warning:** Always include an admin CASE entry (`authMode: 2, privilege: 5`) as the first entry. Omitting it will lock the controller out of the node and require a factory reset.
+
+> `group_add` adds Group-auth ACL entries automatically. Use `set_acl_entry` only when you need direct ACL control (e.g. custom privilege levels or removing stale entries).
+
+**ACL Entry fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `privilege` | int | `1`=View, `3`=Operate, `4`=Manage, `5`=Admin |
+| `authMode` | int | `1`=PASE (commissioning), `2`=CASE (unicast), `3`=Group (multicast) |
+| `subjects` | list[int] \| null | Node IDs for CASE entries; Group IDs for Group entries; `null` = any subject |
+| `targets` | list \| null | Cluster/endpoint scope restriction; `null` = all |
+| `fabricIndex` | int | Fabric index (use `1` for the controller's fabric) |
+
+Example — standard ACL: admin CASE entry + Operate permission for group 257:
+
 ```json
 {
   "message_id": "1",
   "command": "set_acl_entry",
   "args": {
     "node_id": 1,
-    "entry": []
+    "entry": [
+      {"privilege": 5, "authMode": 2, "subjects": null, "targets": null, "fabricIndex": 1},
+      {"privilege": 3, "authMode": 3, "subjects": [257], "targets": null, "fabricIndex": 1}
+    ]
   }
 }
 ```
+
+| Arg | Required | Description |
+|---|---|---|
+| `node_id` | Yes | Target node |
+| `entry` | Yes | List of ACL entry objects (replaces entire ACL) |
 
 **Response:** `{ "message_id": "1", "result": null }`
 
@@ -872,6 +898,37 @@ is queried directly from the device with `group_list` or `group_get_membership`.
 - `group_nodes` — per-group set of node IDs that have been provisioned via `group_add`. Used by `group_send_command` to verify device-side keyset presence before sending multicast (automatic re-provisioning if needed).
 
 Everything else (group membership, group names, keyset bindings) lives on the device.
+
+---
+
+#### Group Management — 7-Step Flow
+
+Matter multicast requires 7 configuration steps before a device will process group commands. The table below maps each step to the corresponding WebSocket command.
+
+**Recommended path:** `group_add` handles steps 2–6 atomically. You only need two calls: `group_add` (once per device/endpoint) then `group_send_command`.
+
+| Step | What it does | WebSocket command |
+|---|---|---|
+| 1. Commission | Pair the device with the controller | `commission_with_code` or `commission_on_network` |
+| 2. Install keys on device | `GroupKeyManagement.KeySetWrite` — device-side key slot | **Auto:** `group_add` &nbsp;\|&nbsp; **Manual:** `group_add_key_set` |
+| 3. Map group → keyset | `GroupKeyManagement.GroupKeyMap` write | **Auto:** `group_add` &nbsp;\|&nbsp; **Manual:** `group_bind_key_set` |
+| 4. Add device to group | `Groups.AddGroup` — device endpoint joins the group | **Auto:** `group_add` |
+| 5. Configure Group ACL | `AccessControl` write — allow `authMode=Group` frames | **Auto:** `group_add` &nbsp;\|&nbsp; **Manual:** `set_acl_entry` |
+| 6. Sync controller keys | Inject epoch key into controller's `GroupDataProvider` KVS | **Auto:** `group_add` |
+| 7. Send multicast command | Send command to group address `0xFFFFFFFFFFFFXXXX` | `group_send_command` |
+
+**Minimal example — turn off all lights in group 100:**
+```jsonc
+// Step 1: commission each device (once)
+{ "command": "commission_with_code", "args": { "code": "MT:..." } }
+
+// Steps 2–6: provision each device/endpoint into the group (once per device)
+{ "command": "group_add", "args": { "node_id": 1, "endpoint": 1, "group_id": 100, "group_name": "Living Room" } }
+{ "command": "group_add", "args": { "node_id": 2, "endpoint": 1, "group_id": 100, "group_name": "Living Room" } }
+
+// Step 7: send one multicast frame to control all devices simultaneously
+{ "command": "group_send_command", "args": { "group_id": 100, "cluster_id": 6, "command_name": "Off", "payload": {} } }
+```
 
 ---
 
@@ -1593,4 +1650,367 @@ message = {
         "payload": dataclass_to_dict(command),
     }
 }
+```
+
+---
+
+## Frontend Implementation Guide
+
+This section describes the complete API call flows a frontend engineer needs to implement a Matter controller UI. All examples show the raw WebSocket message sequences — `→` is client→server, `←` is server→client.
+
+---
+
+### 1. Connection Lifecycle
+
+Every session follows this sequence before you can send any commands.
+
+**Step 1.1 — Connect to WebSocket**
+
+URL: `ws://<server-host>:5580/ws`
+
+On connect, the server **immediately pushes** a `server_info` message (no request needed):
+
+```json
+← {
+  "fabric_id": 1,
+  "compressed_fabric_id": 3735928559,
+  "schema_version": 6,
+  "min_supported_schema_version": 1,
+  "sdk_version": "1.0.0",
+  "wifi_credentials_set": true,
+  "thread_credentials_set": false,
+  "bluetooth_enabled": true
+}
+```
+
+Save `schema_version` — you can use it to gate features.
+
+**Step 1.2 — Send `start_listening`**
+
+This is **required** before any other command. It returns the current list of all commissioned nodes and subscribes you to real-time events.
+
+```json
+→ { "message_id": "init-1", "command": "start_listening", "args": {} }
+
+← {
+  "message_id": "init-1",
+  "result": {
+    "fabric_id": 1,
+    "compressed_fabric_id": 3735928559,
+    "schema_version": 6,
+    "min_supported_schema_version": 1,
+    "sdk_version": "1.0.0",
+    "wifi_credentials_set": true,
+    "thread_credentials_set": false,
+    "bluetooth_enabled": true,
+    "nodes": [
+      {
+        "node_id": 1,
+        "date_commissioned": "2026-03-01T10:00:00",
+        "last_interview": "2026-03-01T10:00:05",
+        "interview_version": 1,
+        "available": true,
+        "is_bridge": false,
+        "attributes": {
+          "0/40/3": "Tapo",
+          "1/6/0": false
+        }
+      }
+    ]
+  }
+}
+```
+
+After this response, the server will push unsolicited **event messages** as things change (node added, attribute updated, etc.). See the [WebSocket Events](#websocket-events) section for the full list.
+
+**Key points:**
+- Use the `nodes` array from `start_listening` to populate your initial device list.
+- Keep the WebSocket connection open for the lifetime of your UI session.
+- `message_id` can be any unique string — use a UUID or an incrementing counter.
+- Responses may (rarely) arrive out of order. Always match by `message_id`.
+
+---
+
+### 2. Commissioning a New Device
+
+Commission a device before doing anything else with it. On success you get its `node_id`.
+
+**Option A — QR code / setup code (most common):**
+
+```json
+→ {
+  "message_id": "comm-1",
+  "command": "commission_with_code",
+  "args": { "code": "MT:Y3D0-M15AJ0648G00" }
+}
+
+← {
+  "message_id": "comm-1",
+  "result": {
+    "node_id": 3,
+    "date_commissioned": "2026-03-31T12:00:00",
+    "last_interview": "2026-03-31T12:00:05",
+    "interview_version": 1,
+    "available": true,
+    "is_bridge": false,
+    "attributes": {}
+  }
+}
+```
+
+Save the returned `node_id` — it is how you address this device in all future calls.
+
+Shortly after, the server will also push a `node_added` event (you can use either to update your UI):
+
+```json
+← { "event": "node_added", "data": { "node_id": 3, "available": true, ... } }
+```
+
+**Option B — on-network by IP (no QR code):**
+
+```json
+→ {
+  "message_id": "comm-2",
+  "command": "commission_on_network",
+  "args": {
+    "setup_pin_code": 20202021,
+    "ip_addr": "192.168.1.42"
+  }
+}
+```
+
+Response is the same `MatterNodeData` object.
+
+**Error handling:**
+
+| `error_code` | Meaning |
+|---|---|
+| `NodeCommissionFailed` | Pairing failed — wrong code, device not in pairing mode, or BLE/network issue |
+| `InvalidArguments` | Malformed setup code |
+
+---
+
+### 3. Unicast Device Commands (single device)
+
+Use `device_command` to send a command to one specific device endpoint.
+
+**Turn a light on (OnOff cluster):**
+
+```json
+→ {
+  "message_id": "cmd-1",
+  "command": "device_command",
+  "args": {
+    "node_id": 1,
+    "endpoint_id": 1,
+    "cluster_id": 6,
+    "command_name": "On",
+    "payload": {}
+  }
+}
+
+← { "message_id": "cmd-1", "result": null }
+```
+
+**Common cluster IDs and command names:**
+
+| Cluster | `cluster_id` | `command_name` | `payload` fields |
+|---|---|---|---|
+| OnOff | `6` | `On` / `Off` / `Toggle` | `{}` |
+| Level Control | `8` | `MoveToLevel` | `{"level": 0–254, "transitionTime": 0}` |
+| Color Control | `768` | `MoveToHueAndSaturation` | `{"hue": 0–254, "saturation": 0–254, "transitionTime": 0}` |
+| Color Control | `768` | `MoveToColorTemperature` | `{"colorTemperatureMireds": 153–500, "transitionTime": 0}` |
+| Thermostat | `513` | `SetpointRaiseLower` | `{"mode": 0, "amount": 10}` |
+| Door Lock | `257` | `LockDoor` / `UnlockDoor` | `{}` |
+
+After a successful command, the server will push `attribute_updated` events reflecting the new device state:
+
+```json
+← { "event": "attribute_updated", "data": [1, "1/6/0", true] }
+```
+
+`data` is `[node_id, attribute_path, new_value]`. The attribute path format is `endpoint/cluster/attribute`.
+
+---
+
+### 4. Group Setup Flow (multicast — one command controls many devices)
+
+Groups let you control multiple devices with a single multicast frame. The setup is a **one-time operation per device**. After setup, sending a command to the group takes one call regardless of how many devices are in the group.
+
+**Full sequence for a 3-light "Living Room" group:**
+
+```json
+// --- SETUP (one-time, per device) ---
+
+// Add node 1, endpoint 1 to group 100
+→ { "message_id": "ga-1", "command": "group_add", "args": { "node_id": 1, "endpoint": 1, "group_id": 100, "group_name": "Living Room" } }
+← { "message_id": "ga-1", "result": null }
+
+// Add node 2, endpoint 1 to group 100
+→ { "message_id": "ga-2", "command": "group_add", "args": { "node_id": 2, "endpoint": 1, "group_id": 100, "group_name": "Living Room" } }
+← { "message_id": "ga-2", "result": null }
+
+// Add node 3, endpoint 1 to group 100
+→ { "message_id": "ga-3", "command": "group_add", "args": { "node_id": 3, "endpoint": 1, "group_id": 100, "group_name": "Living Room" } }
+← { "message_id": "ga-3", "result": null }
+
+// --- CONTROL (every time you want to control the group) ---
+
+// Turn off all 3 lights with one message
+→ { "message_id": "gs-1", "command": "group_send_command", "args": { "group_id": 100, "cluster_id": 6, "command_name": "Off", "payload": {} } }
+← { "message_id": "gs-1", "result": null }
+```
+
+**Important notes for the frontend:**
+- `group_add` calls must complete **sequentially** for the same device (do not fire them in parallel for the same `node_id`).
+- You **can** run `group_add` calls for different `node_id`s in parallel.
+- `group_send_command` is fire-and-forget at the protocol level — `result: null` means the controller sent the multicast frame, not that devices confirmed receipt.
+- No `attribute_updated` events will arrive from groupcast — multicast is unidirectional.
+- The group setup survives server restarts. You do not need to call `group_add` again unless a device was factory reset or removed from the group.
+
+**Recommended group_id ranges:**
+
+| Range | Use |
+|---|---|
+| 1–255 | Application groups (production use) |
+| 256–65527 | Also valid for production |
+| 65528–65535 | Reserved by Matter spec — do not use |
+
+---
+
+### 5. Querying Group State
+
+**List all groups a device endpoint belongs to:**
+
+```json
+→ { "message_id": "gl-1", "command": "group_list", "args": { "node_id": 1, "endpoint": 1 } }
+
+← {
+  "message_id": "gl-1",
+  "result": {
+    "node_id": 1,
+    "endpoint": 1,
+    "remaining_capacity": 2,
+    "groups": [
+      { "group_id": 100, "group_name": "Living Room" },
+      { "group_id": 200, "group_name": "Downstairs" }
+    ]
+  }
+}
+```
+
+`remaining_capacity` is how many more groups this endpoint can join (`null` if the device does not report it).
+
+---
+
+### 6. Removing Devices from Groups
+
+**Remove one device from a group:**
+
+```json
+→ { "message_id": "gr-1", "command": "group_remove", "args": { "node_id": 1, "endpoint": 1, "group_id": 100 } }
+← { "message_id": "gr-1", "result": null }
+```
+
+**Remove a device from all groups at once:**
+
+```json
+→ { "message_id": "gra-1", "command": "group_remove_all", "args": { "node_id": 1, "endpoint": 1 } }
+← { "message_id": "gra-1", "result": null }
+```
+
+Both calls automatically clean up orphaned encryption keysets on the device so future `group_add` calls don't hit `ResourceExhausted`.
+
+---
+
+### 7. Reading and Writing Attributes
+
+**Read a single attribute** (e.g. current OnOff state on node 1, endpoint 1):
+
+```json
+→ {
+  "message_id": "ra-1",
+  "command": "read_attribute",
+  "args": { "node_id": 1, "attribute_path": "1/6/0" }
+}
+
+← {
+  "message_id": "ra-1",
+  "result": { "1/6/0": true }
+}
+```
+
+**Attribute path format:** `endpoint_id/cluster_id/attribute_id`
+Use `*` as a wildcard: `"1/*/*"` reads all attributes on endpoint 1.
+
+**Write an attribute** (e.g. set brightness to 50%):
+
+```json
+→ {
+  "message_id": "wa-1",
+  "command": "write_attribute",
+  "args": {
+    "node_id": 1,
+    "attribute_path": "1/8/0",
+    "value": 127
+  }
+}
+
+← { "message_id": "wa-1", "result": null }
+```
+
+---
+
+### 8. Handling Errors
+
+All errors follow the same shape:
+
+```json
+← {
+  "message_id": "cmd-1",
+  "error_code": "NodeNotReady",
+  "details": "Node 1 is not (yet) available."
+}
+```
+
+**Error codes you will encounter:**
+
+| `error_code` | When it happens | What to do |
+|---|---|---|
+| `NodeNotReady` | Command sent to an offline node | Wait for `node_updated` event with `available: true`, then retry |
+| `NodeNotExists` | `node_id` is not commissioned | Re-commission or update UI |
+| `InvalidArguments` | Bad parameters (e.g. endpoint missing Groups cluster) | Fix parameters; check endpoint capabilities |
+| `NodeCommissionFailed` | Pairing failed | Show error to user, ask to retry |
+| `InvalidCommand` | Unknown command name | Check command spelling / schema version |
+| `SDKStackError` | Low-level chip SDK error | Log `details` and surface generic error to user |
+
+**No `error_code` field = success.** A successful response always has a `result` field (may be `null`).
+
+---
+
+### 9. Event Handling Reference
+
+After `start_listening`, listen for these server-pushed events alongside command responses. Events have no `message_id`.
+
+| Event | When | Key `data` fields |
+|---|---|---|
+| `node_added` | New device commissioned | Full `MatterNodeData` object |
+| `node_updated` | Device re-interviewed or availability changed | Partial `MatterNodeData` (only changed fields) |
+| `node_removed` | Device removed from fabric | `node_id` (integer) |
+| `attribute_updated` | Attribute changed on a subscribed node | `[node_id, "ep/cluster/attr", new_value]` |
+| `node_event` | Cluster event fired (e.g. button press) | `{node_id, endpoint_id, cluster_id, event_id, data}` |
+| `server_shutdown` | Server is shutting down | — |
+
+**Pattern for keeping UI in sync:**
+
+```
+on connect:
+  receive server_info → save schema_version
+  send start_listening → populate device list from result.nodes
+
+on message:
+  if message has message_id → match to pending request, resolve/reject it
+  if message has event → dispatch to event handler
+    node_added / node_updated / node_removed → update device list
+    attribute_updated → update attribute cache for that node
 ```

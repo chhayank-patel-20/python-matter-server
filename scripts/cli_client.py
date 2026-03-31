@@ -83,6 +83,20 @@ async def listen(client: MatterClient):
     await stop_event.wait()
 
 
+async def discover(client: MatterClient):
+    """Discover commissionable nodes via BLE/mDNS."""
+    print("Discovering commissionable nodes...")
+    try:
+        nodes = await client.discover_commissionable_nodes()
+        if not nodes:
+            print("No commissionable nodes found.")
+            return
+        for node in nodes:
+            print(node)
+    except MatterError as e:
+        print(f"Discovery failed: {e}")
+
+
 async def main():
     """Run the CLI client."""
     parser = argparse.ArgumentParser(description="Matter Server CLI Client")
@@ -119,6 +133,9 @@ async def main():
         "endpoint_id", type=int, default=1, nargs="?", help="Endpoint ID"
     )
 
+    # Discover command
+    subparsers.add_parser("discover", help="Discover commissionable nodes via BLE/mDNS")
+
     # Listen command
     subparsers.add_parser("listen", help="Listen for real-time events")
 
@@ -142,6 +159,8 @@ async def main():
                 await get_server_info(client)
             elif args.command == "commission":
                 await commission(client, args.code)
+            elif args.command == "discover":
+                await discover(client)
             elif args.command in ["on", "off", "toggle"]:
                 await send_command(client, args.node_id, args.endpoint_id, args.command)
             elif args.command == "listen":
