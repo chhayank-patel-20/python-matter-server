@@ -63,6 +63,8 @@ class APICommand(StrEnum):
     GROUP_ADD = "group_add"
     GROUP_REMOVE = "group_remove"
     GROUP_REMOVE_ALL = "group_remove_all"
+    GROUP_KEY_SET_REMOVE = "group_key_set_remove"
+    GROUP_RESET_NODE = "group_reset_node"
     GROUP_LIST = "group_list"
     GROUP_GET_MEMBERSHIP = "group_get_membership"
     GROUP_SEND_COMMAND = "group_send_command"

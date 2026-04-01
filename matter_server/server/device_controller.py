@@ -2120,6 +2120,161 @@ class MatterDeviceController:
                 subkey=str(gid),
             )
 
+    @api_command(APICommand.GROUP_KEY_SET_REMOVE)
+    async def group_key_set_remove(self, node_id: int, keyset_id: int) -> None:
+        """Remove a specific group keyset from a node by keyset ID.
+
+        Sends GroupKeyManagement.KeySetRemove to endpoint 0 of the target node.
+        keyset_id=0 (the IPK) is explicitly forbidden — removing it would break
+        all unicast communication with the node.
+
+        Device errors (e.g. InteractionModelError NOT_FOUND) are propagated to
+        the caller.  Use group_debug_info first to discover installed keyset IDs.
+
+        After a successful removal:
+        - The keyset_id is discarded from the controller _known_keysets_per_node
+          tracker so it is not offered as a reuse candidate in future cleanups.
+        - For any group whose stored keyset_id matches the removed one:
+          - node_id is removed from that group's provisioned-nodes set.
+          - If no provisioned nodes remain for that group, the group_key_store
+            entry is also purged (the epoch key is no longer useful anywhere).
+          - If other nodes are still provisioned for that group, the store entry
+            is kept so those nodes can continue to groupcast.
+        """
+        if keyset_id == 0:
+            raise InvalidArguments(
+                "keyset_id 0 is the IPK and must never be removed. "
+                "Use group_reset_node for a full group state reset."
+            )
+        await self._chip_device_controller.send_command(
+            node_id,
+            0,
+            Clusters.GroupKeyManagement.Commands.KeySetRemove(groupKeySetID=keyset_id),
+            timed_request_timeout_ms=5000,
+        )
+        LOGGER.info("Removed keyset %s from node %s", keyset_id, node_id)
+
+        # Update controller tracker.
+        tracked = self._known_keysets_per_node.get(node_id)
+        if tracked is not None:
+            tracked.discard(keyset_id)
+            self.server.storage.set(
+                DATA_KEY_NODE_KEYSETS, sorted(tracked), subkey=str(node_id)
+            )
+
+        # Single-pass: update provisioned_nodes and purge group_key_store for
+        # any group whose stored keyset matches the removed one.
+        for gid, (kid, _) in list(self._group_key_store.items()):
+            if kid != keyset_id:
+                continue
+            provisioned = self._group_provisioned_nodes.get(gid, set())
+            provisioned.discard(node_id)
+            if not provisioned:
+                # No nodes left for this group — purge the key store entry.
+                del self._group_key_store[gid]
+                self.server.storage.remove(DATA_KEY_GROUP_KEYS, subkey=str(gid))
+                LOGGER.info(
+                    "Purged group_key_store entry for group %s "
+                    "(keyset %s removed from node %s, no provisioned nodes remain)",
+                    gid,
+                    keyset_id,
+                    node_id,
+                )
+            else:
+                # Other nodes still use this group — update provisioned set only.
+                self.server.storage.set(
+                    DATA_KEY_GROUP_NODES, sorted(provisioned), subkey=str(gid)
+                )
+
+    @api_command(APICommand.GROUP_RESET_NODE)
+    async def group_reset_node(self, node_id: int) -> None:
+        """Full group state reset on a node without removing the fabric.
+
+        Use this when group_remove_all cannot recover the node — for example
+        when groups span multiple endpoints and the keyset table is full with
+        no clean way to identify which individual keysets to remove.
+
+        Steps performed:
+        1. Brute-force KeySetRemove for keyset IDs 1-63.  NOT_FOUND errors are
+           silently ignored (expected for IDs that were never written).
+        2. Remove all Group-auth ACL entries from the device's Access Control
+           cluster (calls _remove_all_group_acl_entries_on_node).
+        3. Clear server-side tracking for this node:
+           - _known_keysets_per_node[node_id] is dropped.
+           - node_id is removed from _group_provisioned_nodes for every group.
+           - _group_key_store entries for groups with no remaining provisioned
+             nodes are purged (the epoch key is no longer useful anywhere).
+
+        NOTE: This does NOT send RemoveAllGroups.  Removing all keysets renders
+        all groupcast messages undecryptable, which is functionally equivalent.
+        If you need the device's group membership tables explicitly cleared, call
+        group_remove_all for each application endpoint after this command.
+
+        NOTE: The fabric remains intact.  The node stays paired to the controller.
+        Only group-related state is cleared.  Call group_add to re-provision.
+        """
+        LOGGER.info(
+            "Starting full group state reset on node %s (brute-force keyset removal 1-63)",
+            node_id,
+        )
+
+        # Step 1: Brute-force remove all keysets 1-63.
+        removed_count = 0
+        for kid in self._BRUTE_FORCE_KEYSET_RANGE:
+            try:
+                await self._chip_device_controller.send_command(
+                    node_id,
+                    0,
+                    Clusters.GroupKeyManagement.Commands.KeySetRemove(
+                        groupKeySetID=kid
+                    ),
+                    timed_request_timeout_ms=5000,
+                )
+                removed_count += 1
+            except Exception:  # noqa: BLE001, S110  # pylint: disable=W0718
+                pass  # NOT_FOUND is expected for IDs that were never written.
+
+        LOGGER.info(
+            "group_reset_node: removed %d keysets from node %s", removed_count, node_id
+        )
+
+        # Step 2: Remove all Group-auth ACL entries.
+        await self._remove_all_group_acl_entries_on_node(node_id)
+
+        # Step 3a: Clear controller keyset tracker for this node.
+        if node_id in self._known_keysets_per_node:
+            self._known_keysets_per_node.pop(node_id)
+            self.server.storage.remove(DATA_KEY_NODE_KEYSETS, subkey=str(node_id))
+
+        # Step 3b: Remove node from provisioned-nodes tracker for every group.
+        affected_groups = [
+            gid
+            for gid, nodes in self._group_provisioned_nodes.items()
+            if node_id in nodes
+        ]
+        purged_count = 0
+        for gid in affected_groups:
+            self._group_provisioned_nodes[gid].discard(node_id)
+            if not self._group_provisioned_nodes[gid]:
+                # No provisioned nodes remain — purge key store entry.
+                self._group_key_store.pop(gid, None)
+                self.server.storage.remove(DATA_KEY_GROUP_KEYS, subkey=str(gid))
+                purged_count += 1
+            else:
+                self.server.storage.set(
+                    DATA_KEY_GROUP_NODES,
+                    sorted(self._group_provisioned_nodes[gid]),
+                    subkey=str(gid),
+                )
+
+        LOGGER.info(
+            "group_reset_node complete on node %s: removed %d keysets, "
+            "purged %d group key store entries. Call group_add to re-provision.",
+            node_id,
+            removed_count,
+            purged_count,
+        )
+
     @api_command(APICommand.GROUP_LIST)
     async def group_list(self, node_id: int, endpoint: int) -> GroupListResult:
         """Return all groups an endpoint belongs to, with names and remaining capacity.

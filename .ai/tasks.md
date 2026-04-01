@@ -48,6 +48,8 @@
 - [x] Fix `scripts/cli_client.py`: add missing `discover()` function + subparser, remove corrupted duplicate content at end of file.
 - [x] Update `docs/websockets_api.md`: expand `set_acl_entry` with ACL entry format table and real example; add "Group Management — 7-Step Flow" quick reference section mapping each step to WebSocket commands.
 - [x] Add "Frontend Implementation Guide" section to `docs/websockets_api.md`: complete request/response flows for connection lifecycle, commissioning, unicast commands, group setup/teardown, attribute read/write, error handling, and event handling.
+- [x] Add `group_key_set_remove` API command: sends `GroupKeyManagement.KeySetRemove` for a specific keyset ID on a node (guards IPK removal, propagates NOT_FOUND to caller, updates `_known_keysets_per_node` and `_group_key_store`).
+- [x] Add `group_reset_node` API command: brute-force removes all keysets 1–63, removes all Group-auth ACL entries, clears all server-side group tracking for the node. Fabric stays intact — use when `group_remove_all` cannot recover from a full keyset table spanning multiple endpoints.
 
 ## Backlog
 - [ ] Investigate why `discovery_updated` events are not appearing in the dashboard (optional).
