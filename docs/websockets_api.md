@@ -992,11 +992,20 @@ group_add(node_id=3, endpoint=1, group_id=100, group_name="Lights")
 
 ---
 
-**`group_remove`** — Remove a node endpoint from a group
+**`group_remove`** — Remove a group from ALL endpoints on the node
 
-Sends `Groups.RemoveGroup` to the device, removes orphaned keysets (3-tier cleanup), then removes the Group-auth ACL entry for this group from the device's ACL.
+Removes `group_id` from every application endpoint on the node, strips its GroupKeyMap binding, and reclaims the keyset slot.
 
-> **Matter spec note:** `RemoveGroup` clears the group membership entry but does **not** remove the associated keyset. The server runs `_cleanup_unused_keysets_on_node` after every removal — see `group_remove_all` for the 3-tier cleanup strategy.
+> **Why all endpoints?** GroupKeyMap (endpoint 0) is fabric-wide — a single binding covers all endpoints. Removing the group from one endpoint while leaving GroupKeyMap intact causes the keyset to appear "still referenced" forever, permanently blocking keyset slot reclamation. Removing the group means removing it completely, so `group_list` on any endpoint reflects the true state.
+
+Steps performed:
+1. Read `Descriptor.PartsList` to discover all application endpoints.
+2. Send `Groups.RemoveGroup(group_id)` to each endpoint. `NOT_FOUND` on endpoints that don't have this group is silently ignored.
+3. Strip `group_id` from `GroupKeyMap` and write the updated map back to the device.
+4. Run keyset cleanup (`_cleanup_unused_keysets_on_node`) — the keyset is now unreferenced and is removed.
+5. Remove the Group-auth ACL entry for this group.
+
+> The `endpoint` argument in the request is kept for API compatibility but the server removes the group from all endpoints regardless of which endpoint is specified.
 
 ```json
 {
@@ -1014,17 +1023,19 @@ Sends `Groups.RemoveGroup` to the device, removes orphaned keysets (3-tier clean
 
 ---
 
-**`group_remove_all`** — Remove all groups from a node endpoint
+**`group_remove_all`** — Remove all groups (from ALL endpoints) that are listed on a given endpoint
 
-Sends `Groups.RemoveAllGroups` to the device, waits 300 ms for the device to commit its internal state, then removes all orphaned keysets using a 3-tier strategy:
+Uses the specified `endpoint` as a reference to discover which groups to remove, then removes each of those groups from every application endpoint on the node — same logic as `group_remove`, applied in bulk.
 
-1. **Tier 1 — `GroupKeyTable`** (preferred): reads the device's full keyset table. Spec-compliant devices expose this; subtract still-referenced keysets and remove orphans. Logged as `"using Tier-1 (GroupKeyTable)"`.
-2. **Tier 2 — controller tracker** (`node_keysets`): if the device does not expose `GroupKeyTable` (e.g. Tapo), use the server's persistent record of every `KeySetWrite` it sent to this node. Logged as `"using Tier-2 (controller tracker)"`.
-3. **Tier 3 — brute-force** (mandatory fallback): if both tiers above produce no keyset IDs, iterate IDs 1–63 and call `KeySetRemove` on each. Devices return `NOT_FOUND` for IDs that do not exist — those errors are silently ignored. Logged as a `WARNING`. This tier is **never skipped**, ensuring keyset slots are always reclaimed even on fully constrained devices.
+Steps performed:
+1. Read `GetGroupMembership` on the reference endpoint to collect the group IDs to remove.
+2. Read `Descriptor.PartsList` to discover all application endpoints.
+3. For each group ID: send `Groups.RemoveGroup` to every endpoint. `NOT_FOUND` is silently ignored.
+4. Strip all removed group IDs from `GroupKeyMap` and write the updated map back to the device.
+5. Run keyset cleanup — keysets are now unreferenced and are removed.
+6. Remove all Group-auth ACL entries from the device.
 
-> The 300 ms sync barrier prevents a race where some devices have not yet flushed the `RemoveAllGroups` state to their internal key map before the server reads `GroupKeyMap` to discover referenced keysets. Without it, stale `GroupKeyMap` entries can cause cleanup to incorrectly preserve orphaned keysets.
-
-> After this call the node's keyset slots are fully reclaimed regardless of how much the device exposes about its internal state.
+> Groups that exist **only** on other endpoints (not the reference endpoint) are **not** removed. Only the groups discovered on the reference endpoint are affected.
 
 ```json
 {

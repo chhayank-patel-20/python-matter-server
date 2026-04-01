@@ -1721,6 +1721,25 @@ class MatterDeviceController:
                 "Failed to remove Group ACL entries from node %s: %s", node_id, err
             )
 
+    async def _get_node_endpoints(self, node_id: int) -> list[int]:
+        """Return all application endpoint IDs from Descriptor.PartsList on endpoint 0.
+
+        Returns an empty list if the attribute is unavailable or the read fails.
+        """
+        try:
+            result = await self._chip_device_controller.read_attribute(
+                node_id=node_id,
+                attributes=[(0, Clusters.Descriptor.Attributes.PartsList)],
+            )
+            if result is not None and result.attributes is not None:
+                parts = result.attributes[0][Clusters.Descriptor][
+                    Clusters.Descriptor.Attributes.PartsList
+                ]
+                return [int(ep) for ep in parts]
+        except Exception:  # noqa: BLE001, S110  # pylint: disable=W0718
+            pass
+        return []
+
     async def _get_group_membership_and_capacity(
         self, node_id: int, endpoint: int
     ) -> tuple[list[int], int | None]:
@@ -2062,20 +2081,57 @@ class MatterDeviceController:
 
     @api_command(APICommand.GROUP_REMOVE)
     async def group_remove(self, node_id: int, endpoint: int, group_id: int) -> None:
-        """Remove node from a group, then clean up any orphaned keysets.
+        """Remove a group from ALL endpoints on the node, then clean up keysets.
 
-        Matter note: RemoveGroup removes the group membership entry but does NOT
-        remove the associated keyset.  We call _cleanup_unused_keysets_on_node
-        afterward so keyset slots are reclaimed for future use.
+        Removing a group is a fabric-wide operation: the GroupKeyMap binding
+        (group_id → keyset) lives on endpoint 0 and applies to all endpoints.
+        Removing the group from one endpoint but leaving the GroupKeyMap entry
+        intact causes the keyset to appear "referenced" forever, blocking cleanup
+        and filling the device's fixed keyset table.
+
+        Steps:
+        1. Send RemoveGroup(group_id) to every application endpoint on the node.
+           Endpoints that do not have this group return NOT_FOUND — suppressed.
+        2. Strip group_id from GroupKeyMap and write the updated map back to the
+           device.  This is the key fix: cleanup now sees the keyset as orphaned.
+        3. Run _cleanup_unused_keysets_on_node — keyset is now unrefenced and
+           will be removed from the device.
+        4. Remove the Group-auth ACL entry for this group.
+        5. Update server-side provisioned-nodes tracker.
         """
-        await self._chip_device_controller.send_command(
-            node_id,
-            endpoint,
-            Clusters.Groups.Commands.RemoveGroup(groupID=group_id),
+        # Step 1: Remove from all endpoints (NOT just the caller-specified one).
+        endpoints = await self._get_node_endpoints(node_id)
+        for ep in endpoints:
+            try:  # noqa: SIM105
+                await self._chip_device_controller.send_command(
+                    node_id,
+                    ep,
+                    Clusters.Groups.Commands.RemoveGroup(groupID=group_id),
+                )
+            except Exception:  # noqa: BLE001, S110  # pylint: disable=W0718
+                pass  # NOT_FOUND expected on endpoints that don't have this group.
+
+        # Step 2: Strip group_id from GroupKeyMap and write back.
+        entries = await self._get_node_group_key_map(node_id)
+        new_map = [m for m in entries if m.groupId != group_id]
+        await self._chip_device_controller.write_attribute(
+            node_id=node_id,
+            attributes=[
+                (0, Clusters.GroupKeyManagement.Attributes.GroupKeyMap(new_map))
+            ],
+            timed_request_timeout_ms=5000,
         )
+        LOGGER.info(
+            "Stripped GroupKeyMap entry for group %s on node %s", group_id, node_id
+        )
+
+        # Step 3: Cleanup orphaned keysets — keyset is now unreferenced.
         await self._cleanup_unused_keysets_on_node(node_id)
+
+        # Step 4: Remove ACL entry.
         await self._remove_group_acl_on_node(node_id, group_id)
-        # Remove node from the provisioned-nodes tracker for this group.
+
+        # Step 5: Update provisioned-nodes tracker.
         provisioned = self._group_provisioned_nodes.get(group_id)
         if provisioned and node_id in provisioned:
             provisioned.discard(node_id)
@@ -2085,28 +2141,75 @@ class MatterDeviceController:
 
     @api_command(APICommand.GROUP_REMOVE_ALL)
     async def group_remove_all(self, node_id: int, endpoint: int) -> None:
-        """Remove all groups from a node endpoint, then clean up all orphaned keysets.
+        """Remove ALL groups (from ALL endpoints) that are listed on a given endpoint.
 
-        Matter note: RemoveAllGroups clears the group table but does NOT remove
-        keysets.  Without the cleanup step, repeated add/remove cycles would fill
-        the device's fixed keyset table (typically 3 slots) and cause
-        ResourceExhausted on the next group_add.
+        The caller specifies one endpoint as the reference: the server first reads
+        which groups exist on that endpoint, then removes each of those groups from
+        every application endpoint on the device (same logic as group_remove).
+        GroupKeyMap entries for all removed groups are stripped and written back
+        before keyset cleanup runs — so cleanup correctly identifies the freed
+        keyset slots and reclaims them.
+
+        Why "all endpoints"?
+          GroupKeyMap (endpoint 0) is fabric-wide.  If a group exists on endpoint 1
+          AND endpoint 2, removing it from only endpoint 1 leaves GroupKeyMap intact,
+          making the keyset appear "still referenced" and blocking cleanup.
+          Removing the group means removing it everywhere so the data is consistent:
+          group_list on any endpoint reflects the actual state.
         """
-        await self._chip_device_controller.send_command(
-            node_id,
-            endpoint,
-            Clusters.Groups.Commands.RemoveAllGroups(),
-        )
-        # Brief barrier so the device can commit the RemoveAllGroups state update
-        # before we read GroupKeyMap back for cleanup.  Some devices (including
-        # consumer devices like Tapo) have async internal state machines that may
-        # not reflect the cleared group table immediately; without this pause
-        # GroupKeyMap can still contain stale entries and referenced_ids will be
-        # non-empty, causing cleanup to incorrectly preserve orphaned keysets.
-        await asyncio.sleep(0.3)
+        # Step 1: Get the groups currently on the reference endpoint BEFORE removing.
+        group_ids_to_remove: list[int] = []
+        try:
+            group_ids_to_remove, _ = await self._get_group_membership_and_capacity(
+                node_id, endpoint
+            )
+        except Exception as err:  # noqa: BLE001  # pylint: disable=W0718
+            LOGGER.warning(
+                "group_remove_all: could not read group membership on node %s "
+                "endpoint %s — proceeding with empty group list: %s",
+                node_id,
+                endpoint,
+                err,
+            )
+
+        # Step 2: For each group, remove from ALL application endpoints.
+        if group_ids_to_remove:
+            endpoints = await self._get_node_endpoints(node_id)
+            for group_id in group_ids_to_remove:
+                for ep in endpoints:
+                    try:  # noqa: SIM105
+                        await self._chip_device_controller.send_command(
+                            node_id,
+                            ep,
+                            Clusters.Groups.Commands.RemoveGroup(groupID=group_id),
+                        )
+                    except Exception:  # noqa: BLE001, S110  # pylint: disable=W0718
+                        pass  # NOT_FOUND expected on endpoints without this group.
+
+            # Step 3: Strip all removed group_ids from GroupKeyMap and write back.
+            entries = await self._get_node_group_key_map(node_id)
+            removed_set = set(group_ids_to_remove)
+            new_map = [m for m in entries if m.groupId not in removed_set]
+            await self._chip_device_controller.write_attribute(
+                node_id=node_id,
+                attributes=[
+                    (0, Clusters.GroupKeyManagement.Attributes.GroupKeyMap(new_map))
+                ],
+                timed_request_timeout_ms=5000,
+            )
+            LOGGER.info(
+                "Stripped GroupKeyMap entries for groups %s on node %s",
+                sorted(removed_set),
+                node_id,
+            )
+
+        # Step 4: Cleanup orphaned keysets — GroupKeyMap no longer references them.
         await self._cleanup_unused_keysets_on_node(node_id)
+
+        # Step 5: Remove all Group-auth ACL entries.
         await self._remove_all_group_acl_entries_on_node(node_id)
-        # Remove node from provisioned-nodes tracker for every group it was in.
+
+        # Step 6: Update provisioned-nodes tracker for every affected group.
         changed_groups = [
             gid
             for gid, nodes in self._group_provisioned_nodes.items()
