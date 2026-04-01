@@ -1865,7 +1865,11 @@ class MatterDeviceController:
                 self._BRUTE_FORCE_KEYSET_RANGE.start,
                 self._BRUTE_FORCE_KEYSET_RANGE.stop - 1,
             )
-            all_keyset_ids = set(self._BRUTE_FORCE_KEYSET_RANGE)
+            # Also include server-assigned keyset IDs from the group key store.
+            # The formula keyset_id = (group_id % 0xFFFE) + 1 produces IDs that
+            # can be >> 63; the standard range alone misses them.
+            store_ids = {kid for kid, _ in self._group_key_store.values()} - {0}
+            all_keyset_ids = set(self._BRUTE_FORCE_KEYSET_RANGE) | store_ids
             brute_force = True
 
         # Orphaned = present on device but not referenced by any active group binding;
@@ -2316,14 +2320,26 @@ class MatterDeviceController:
         NOTE: The fabric remains intact.  The node stays paired to the controller.
         Only group-related state is cleared.  Call group_add to re-provision.
         """
-        LOGGER.info(
-            "Starting full group state reset on node %s (brute-force keyset removal 1-63)",
-            node_id,
-        )
+        LOGGER.info("Starting full group state reset on node %s", node_id)
 
-        # Step 1: Brute-force remove all keysets 1-63.
+        # Step 1: Remove all keysets from the device.
+        #
+        # IMPORTANT: collect targeted IDs BEFORE clearing the tracker/key_store
+        # (Step 3).  The formula keyset_id = (group_id % 0xFFFE) + 1 produces IDs
+        # that can be >> 63; the standard brute-force range(1, 64) completely misses
+        # them.  By pulling from the tracker and key_store first we get the exact IDs
+        # the server has written to this node.
+        targeted_ids: set[int] = set(self._known_keysets_per_node.get(node_id, set()))
+        targeted_ids |= {
+            kid
+            for gid, (kid, _) in self._group_key_store.items()
+            if node_id in self._group_provisioned_nodes.get(gid, set())
+        }
+        targeted_ids.discard(0)  # Never remove IPK.
+
+        # Step 1a: Targeted removal of all known server-assigned IDs.
         removed_count = 0
-        for kid in self._BRUTE_FORCE_KEYSET_RANGE:
+        for kid in targeted_ids:
             try:
                 await self._chip_device_controller.send_command(
                     node_id,
@@ -2335,11 +2351,47 @@ class MatterDeviceController:
                 )
                 removed_count += 1
             except Exception:  # noqa: BLE001, S110  # pylint: disable=W0718
-                pass  # NOT_FOUND is expected for IDs that were never written.
+                pass
+
+        # Step 1b: Brute-force standard range for any IDs not already targeted.
+        for kid in self._BRUTE_FORCE_KEYSET_RANGE:
+            if kid in targeted_ids or kid == 0:
+                continue
+            try:
+                await self._chip_device_controller.send_command(
+                    node_id,
+                    0,
+                    Clusters.GroupKeyManagement.Commands.KeySetRemove(
+                        groupKeySetID=kid
+                    ),
+                    timed_request_timeout_ms=5000,
+                )
+                removed_count += 1
+            except Exception:  # noqa: BLE001, S110  # pylint: disable=W0718
+                pass
 
         LOGGER.info(
             "group_reset_node: removed %d keysets from node %s", removed_count, node_id
         )
+
+        # Step 1c: Clear GroupKeyMap on the device.  Without this, stale bindings
+        # survive the reset and make _cleanup_unused_keysets_on_node think keysets
+        # are still referenced on the next group_add.
+        try:
+            await self._chip_device_controller.write_attribute(
+                node_id=node_id,
+                attributes=[
+                    (0, Clusters.GroupKeyManagement.Attributes.GroupKeyMap([]))
+                ],
+                timed_request_timeout_ms=5000,
+            )
+            LOGGER.info("group_reset_node: cleared GroupKeyMap on node %s", node_id)
+        except Exception as err:  # noqa: BLE001  # pylint: disable=W0718
+            LOGGER.warning(
+                "group_reset_node: failed to clear GroupKeyMap on node %s: %s",
+                node_id,
+                err,
+            )
 
         # Step 2: Remove all Group-auth ACL entries.
         await self._remove_all_group_acl_entries_on_node(node_id)

@@ -1092,9 +1092,10 @@ Use this when `group_remove_all` cannot recover the node — for example when th
 
 **What it does:**
 
-1. Calls `GroupKeyManagement.KeySetRemove` for every keyset ID 1–63. `NOT_FOUND` errors are silently ignored (expected for IDs that were never written). This empties all keyset slots on the device.
-2. Removes all Group-auth ACL entries from the device's Access Control cluster (same cleanup as `group_remove_all`).
-3. Clears all server-side group tracking for this node: `node_keysets`, per-group `group_nodes` entries, and (for groups with no remaining provisioned nodes) `group_keys` store entries.
+1. **Targeted keyset removal:** reads the server's keyset tracker and `group_keys` store to collect the exact keyset IDs that were written to this node (the server uses `keyset_id = (group_id % 0xFFFE) + 1`, so IDs can be well above 63). Removes those explicitly via `KeySetRemove`, then sweeps IDs 1–63 for any remaining standard slots. `NOT_FOUND` errors are silently ignored.
+2. **Clears GroupKeyMap** on the device (writes empty map) so stale bindings cannot mislead future keyset cleanup.
+3. Removes all Group-auth ACL entries from the device's Access Control cluster.
+4. Clears all server-side group tracking for this node: `node_keysets`, per-group `group_nodes` entries, and (for groups with no remaining provisioned nodes) `group_keys` store entries.
 
 > **Does NOT send `RemoveAllGroups`:** Removing all keysets renders all groupcast messages undecryptable by the device, which is functionally equivalent. If you need the device's group membership tables explicitly cleared, call `group_remove_all` for each application endpoint after this command.
 
