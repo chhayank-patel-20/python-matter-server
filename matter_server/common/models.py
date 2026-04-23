@@ -75,6 +75,14 @@ class APICommand(StrEnum):
     SCAN_BLE_DEVICES = "scan_ble_devices"
     COMMISSION_WITH_MAC = "commission_with_mac"
     COMMISSION_ON_COMMISSIONING_WINDOW = "commission_on_commissioning_window"
+    SCENE_ADD = "scene_add"
+    SCENE_VIEW = "scene_view"
+    SCENE_REMOVE = "scene_remove"
+    SCENE_REMOVE_ALL = "scene_remove_all"
+    SCENE_STORE = "scene_store"
+    SCENE_RECALL = "scene_recall"
+    SCENE_GET_MEMBERSHIP = "scene_get_membership"
+    SCENE_COPY = "scene_copy"
 
 
 EventCallBackType = Callable[[EventType, Any], None]

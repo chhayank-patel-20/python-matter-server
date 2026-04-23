@@ -2503,6 +2503,161 @@ class MatterDeviceController:
             },
         }
 
+    @api_command(APICommand.SCENE_ADD)
+    async def scene_add(
+        self,
+        node_id: int,
+        endpoint_id: int,
+        group_id: int,
+        scene_id: int,
+        transition_time: int,
+        scene_name: str,
+        extension_field_sets: list[dict],
+    ) -> Any:
+        """Add a scene to a node."""
+        command = Clusters.ScenesManagement.Commands.AddScene(
+            groupID=group_id,
+            sceneID=scene_id,
+            transitionTime=transition_time,
+            sceneName=scene_name,
+            extensionFieldSets=[
+                dataclass_from_dict(
+                    Clusters.ScenesManagement.Structs.ExtensionFieldSetStruct, efs
+                )
+                for efs in extension_field_sets
+            ],
+        )
+        return await self._chip_device_controller.send_command(
+            node_id, endpoint_id, command
+        )
+
+    @api_command(APICommand.SCENE_VIEW)
+    async def scene_view(
+        self, node_id: int, endpoint_id: int, group_id: int, scene_id: int
+    ) -> Any:
+        """View a scene on a node."""
+        command = Clusters.ScenesManagement.Commands.ViewScene(
+            groupID=group_id, sceneID=scene_id
+        )
+        return await self._chip_device_controller.send_command(
+            node_id, endpoint_id, command
+        )
+
+    @api_command(APICommand.SCENE_REMOVE)
+    async def scene_remove(
+        self, node_id: int, endpoint_id: int, group_id: int, scene_id: int
+    ) -> Any:
+        """Remove a scene from a node."""
+        command = Clusters.ScenesManagement.Commands.RemoveScene(
+            groupID=group_id, sceneID=scene_id
+        )
+        return await self._chip_device_controller.send_command(
+            node_id, endpoint_id, command
+        )
+
+    @api_command(APICommand.SCENE_REMOVE_ALL)
+    async def scene_remove_all(
+        self, node_id: int, endpoint_id: int, group_id: int
+    ) -> Any:
+        """Remove all scenes for a group from a node."""
+        command = Clusters.ScenesManagement.Commands.RemoveAllScenes(groupID=group_id)
+        return await self._chip_device_controller.send_command(
+            node_id, endpoint_id, command
+        )
+
+    @api_command(APICommand.SCENE_STORE)
+    async def scene_store(
+        self, node_id: int, endpoint_id: int, group_id: int, scene_id: int
+    ) -> Any:
+        """Store current state as a scene on a node."""
+        # Check group membership first to avoid 0x85 INVALID_COMMAND.
+        if group_id != 0:
+            existing_groups, _ = await self._get_group_membership_and_capacity(
+                node_id, endpoint_id
+            )
+            if group_id not in existing_groups:
+                raise InvalidArguments(
+                    f"Node {node_id} endpoint {endpoint_id} is not a member of group {group_id}. "
+                    "You must add it to the group first before storing a scene."
+                )
+
+        command = Clusters.ScenesManagement.Commands.StoreScene(
+            groupID=group_id, sceneID=scene_id
+        )
+        return await self._chip_device_controller.send_command(
+            node_id, endpoint_id, command
+        )
+
+    @api_command(APICommand.SCENE_RECALL)
+    async def scene_recall(
+        self,
+        node_id: int,
+        endpoint_id: int,
+        group_id: int,
+        scene_id: int,
+        transition_time: int | None = None,
+    ) -> Any:
+        """Recall a scene on a node."""
+        # Note: destination-id can be a multicast group address.
+        # If node_id is a group address (multicast), we use send_group_command.
+        command = Clusters.ScenesManagement.Commands.RecallScene(
+            groupID=group_id, sceneID=scene_id, transitionTime=transition_time
+        )
+
+        # check if it's a group node_id (multicast)
+        if node_id >= 0xFFFFFFFFFFFF0000:
+            # 0xffffffffffff0101 -> group 257
+            gid = node_id & 0xFFFF
+            return await self.send_group_command(gid, command)
+
+        # Unicast recall: Check group membership first to avoid 0x85 INVALID_COMMAND.
+        if group_id != 0:
+            existing_groups, _ = await self._get_group_membership_and_capacity(
+                node_id, endpoint_id
+            )
+            if group_id not in existing_groups:
+                raise InvalidArguments(
+                    f"Node {node_id} endpoint {endpoint_id} is not a member of group {group_id}. "
+                    "You must add it to the group first before recalling a scene."
+                )
+
+        return await self._chip_device_controller.send_command(
+            node_id, endpoint_id, command
+        )
+
+    @api_command(APICommand.SCENE_GET_MEMBERSHIP)
+    async def scene_get_membership(
+        self, node_id: int, endpoint_id: int, group_id: int
+    ) -> Any:
+        """Get scene membership for a group on a node."""
+        command = Clusters.ScenesManagement.Commands.GetSceneMembership(
+            groupID=group_id
+        )
+        return await self._chip_device_controller.send_command(
+            node_id, endpoint_id, command
+        )
+
+    @api_command(APICommand.SCENE_COPY)
+    async def scene_copy(
+        self,
+        node_id: int,
+        endpoint_id: int,
+        group_identifier_from: int,
+        scene_identifier_from: int,
+        group_identifier_to: int,
+        scene_identifier_to: int,
+    ) -> Any:
+        """Copy a scene on a node."""
+        command = Clusters.ScenesManagement.Commands.CopyScene(
+            groupIdentifierFrom=group_identifier_from,
+            sceneIdentifierFrom=scene_identifier_from,
+            groupIdentifierTo=group_identifier_to,
+            sceneIdentifierTo=scene_identifier_to,
+        )
+        return await self._chip_device_controller.send_command(
+            node_id, endpoint_id, command
+        )
+
     @staticmethod
     def _derive_group_encryption_key(
         epoch_key: bytes, compressed_fabric_id: int

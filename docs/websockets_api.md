@@ -1348,6 +1348,172 @@ Writes to `GroupKeyManagement.GroupKeyMap` (attribute 0) on endpoint 0.
 Initializes the controller's `GroupDataProvider` with test keys for group IDs **257** and
 **258** only. Use in development/testing environments with test devices.
 
+---
+
+### Scenes Management
+
+The Scenes Management cluster (0x0062) allows devices to store and recall "presets" (e.g., specific brightness and color values) as Scenes. Scenes are scoped to a **Group ID**.
+
+> [!IMPORTANT]
+> **Prerequisite:** For a node to store or recall a scene for a specific `group_id`, it **must** already be a member of that group. If the node is not a member, the command will fail with `INVALID_COMMAND (0x85)`. The server-side API automatically checks for this membership before sending `scene_store` or `scene_recall` and will raise `InvalidArguments` if the prerequisite is not met.
+
+---
+
+**`scene_add`** — Add a scene to a node
+
+Adds a scene with specific extension field sets (the attributes to change when the scene is recalled).
+
+```json
+{
+  "message_id": "1",
+  "command": "scene_add",
+  "args": {
+    "node_id": 1,
+    "endpoint_id": 1,
+    "group_id": 100,
+    "scene_id": 1,
+    "transition_time": 100,
+    "scene_name": "Evening",
+    "extension_field_sets": [
+      {
+        "clusterID": 6,
+        "attributeValuePairs": [
+          { "attributeID": 0, "attributeValue": "01" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+---
+
+**`scene_view`** — View a scene's details
+
+```json
+{
+  "message_id": "1",
+  "command": "scene_view",
+  "args": {
+    "node_id": 1,
+    "endpoint_id": 1,
+    "group_id": 100,
+    "scene_id": 1
+  }
+}
+```
+
+---
+
+**`scene_store`** — Store current state as a scene
+
+Saves the current values of all supported attributes on the endpoint into the specified scene slot.
+
+```json
+{
+  "message_id": "1",
+  "command": "scene_store",
+  "args": {
+    "node_id": 1,
+    "endpoint_id": 1,
+    "group_id": 100,
+    "scene_id": 1
+  }
+}
+```
+
+---
+
+**`scene_recall`** — Recall a previously stored scene
+
+Transitions the endpoint to the state stored in the scene.
+
+```json
+{
+  "message_id": "1",
+  "command": "scene_recall",
+  "args": {
+    "node_id": 1,
+    "endpoint_id": 1,
+    "group_id": 100,
+    "scene_id": 1,
+    "transition_time": 50
+  }
+}
+```
+
+> **Multicast Recall:** To recall a scene for an entire group simultaneously, use the **Group Node ID** (e.g., `0xFFFFFFFFFFFF0101` for group 257) as the `node_id`.
+
+---
+
+**`scene_remove`** — Remove a specific scene
+
+```json
+{
+  "message_id": "1",
+  "command": "scene_remove",
+  "args": {
+    "node_id": 1,
+    "endpoint_id": 1,
+    "group_id": 100,
+    "scene_id": 1
+  }
+}
+```
+
+---
+
+**`scene_remove_all`** — Remove all scenes for a group
+
+```json
+{
+  "message_id": "1",
+  "command": "scene_remove_all",
+  "args": {
+    "node_id": 1,
+    "endpoint_id": 1,
+    "group_id": 100
+  }
+}
+```
+
+---
+
+**`scene_get_membership`** — List all scenes stored for a group
+
+```json
+{
+  "message_id": "1",
+  "command": "scene_get_membership",
+  "args": {
+    "node_id": 1,
+    "endpoint_id": 1,
+    "group_id": 100
+  }
+}
+```
+
+---
+
+**`scene_copy`** — Copy a scene from one slot/group to another
+
+```json
+{
+  "message_id": "1",
+  "command": "scene_copy",
+  "args": {
+    "node_id": 1,
+    "endpoint_id": 1,
+    "group_identifier_from": 100,
+    "scene_identifier_from": 1,
+    "group_identifier_to": 100,
+    "scene_identifier_to": 2
+  }
+}
+```
+
+---
+
 > **Warning:** Do not call this after creating production groups. It rewrites the
 > controller's group-key linked list and will orphan custom group keys, causing
 > `SendGroupCommand` to fail with `0xAC` for any custom group IDs.
